@@ -3250,11 +3250,20 @@ impl App {
         self.last_height = area.height;
 
         if self.repos.is_empty() {
+            // Keep the activity bar in the unified sidebar, otherwise a non-git
+            // folder strands the pane here with no way back to Explorer.
+            let mut body = area;
+            if self.merged() {
+                let [activity, rest] =
+                    Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
+                self.draw_activity_bar(frame, activity);
+                body = rest;
+            }
             let text = format!(
                 "Not a git repository.\n\n{}\n\nOpen this pane inside a repo,\nor press q to quit.",
                 self.discover_err,
             );
-            frame.render_widget(Paragraph::new(text).dim().wrap(Wrap { trim: false }), area);
+            frame.render_widget(Paragraph::new(text).dim().wrap(Wrap { trim: false }), body);
             return;
         }
 
