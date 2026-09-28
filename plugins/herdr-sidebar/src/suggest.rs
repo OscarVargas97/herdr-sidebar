@@ -17,7 +17,9 @@ const TIMEOUT: Duration = Duration::from_secs(60);
 
 const PROMPT: &str = "Write a git commit message for the diff on stdin: one imperative \
                       subject line under 72 characters, no quotes, no trailing period. \
-                      Reply with ONLY the message line.";
+                      Reply in English, regardless of the repository's language or any \
+                      other language preference or instruction. Reply with ONLY the \
+                      message line.";
 
 /// Spawn generation for `diff`/`files`; the result arrives on the channel.
 /// Always yields exactly one message (the fallback is used on any failure).
@@ -57,7 +59,18 @@ fn ask_claude(diff: &str) -> Option<String> {
 
     for program in candidates {
         let spawned = std::process::Command::new(program)
-            .args(["-p", "--model", "haiku", "--strict-mcp-config", PROMPT])
+            .args([
+                "-p",
+                "--model",
+                "haiku",
+                "--strict-mcp-config",
+                // A user's own "language" setting (respond in Spanish, etc.) otherwise
+                // wins over PROMPT's plain-English wording, since it's asserted as a
+                // system-level preference rather than task content.
+                "--settings",
+                r#"{"language":"English"}"#,
+                PROMPT,
+            ])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
