@@ -81,6 +81,7 @@ enum Focus {
 /// The Git-Graph-style drawers below the Changes section.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Drawer {
+    PullRequest,
     Graph,
     Commits,
     FileHistory,
@@ -92,7 +93,8 @@ enum Drawer {
 }
 
 impl Drawer {
-    const ALL: [Drawer; 8] = [
+    const ALL: [Drawer; 9] = [
+        Drawer::PullRequest,
         Drawer::Graph,
         Drawer::Commits,
         Drawer::FileHistory,
@@ -105,6 +107,7 @@ impl Drawer {
 
     fn title(self) -> &'static str {
         match self {
+            Drawer::PullRequest => "Pull Request",
             Drawer::Graph => "Graph",
             Drawer::Commits => "Commits",
             Drawer::FileHistory => "File History",
@@ -149,6 +152,8 @@ enum DrawerRef {
     Tag(String),
     /// A worktree's checkout path.
     Worktree(String),
+    /// The branch's pull request or an issue it closes.
+    Forge(herdr_sidebar::forge::Item),
 }
 
 /// Parse the actionable reference out of one drawer line.
@@ -205,6 +210,9 @@ fn pretty_remote_url(url: &str) -> String {
 
 fn parse_drawer_ref(kind: Drawer, line: &str) -> DrawerRef {
     match kind {
+        Drawer::PullRequest => herdr_sidebar::forge::parse_ref(line)
+            .map(DrawerRef::Forge)
+            .unwrap_or(DrawerRef::None),
         Drawer::Graph | Drawer::Commits | Drawer::FileHistory => line
             .split_whitespace()
             .find(|tok| {
@@ -269,6 +277,9 @@ fn drawer_spec(dref: &DrawerRef) -> Option<String> {
         DrawerRef::Tag(t) => Some(t.clone()),
         DrawerRef::Remote { name, .. } => Some(name.clone()),
         DrawerRef::Worktree(p) => Some(p.clone()),
+        DrawerRef::Forge(
+            herdr_sidebar::forge::Item::Pr(n) | herdr_sidebar::forge::Item::Issue(n),
+        ) => Some(format!("#{n}")),
         DrawerRef::None => None,
     }
 }
@@ -932,7 +943,7 @@ pub struct App {
     snap: bool,
     focus: Focus,
     theme: IconTheme,
-    drawers: [DrawerPanel; 8],
+    drawers: [DrawerPanel; 9],
     /// The file the FILE HISTORY drawer follows: the last selected file row.
     history_target: Option<String>,
     /// One-shot footer notice: (text, is_error). Cleared on the next key press.
@@ -1026,7 +1037,7 @@ impl App {
         // One source of truth: the global setting, so every pane and every
         // folder agrees (a per-folder copy used to override it forever).
         let tree_view = sidebar_state.scm_tree_view;
-        let mut drawers: [DrawerPanel; 8] = Default::default();
+        let mut drawers: [DrawerPanel; 9] = Default::default();
         for kind in Drawer::ALL {
             drawers[kind.index()].expanded = saved.drawers.iter().any(|d| d == kind.title());
         }
@@ -1433,11 +1444,16 @@ impl App {
             return;
         };
         let git = &git;
+        let branch = self
+            .active_repo()
+            .map(|r| r.status.branch.clone())
+            .unwrap_or_default();
         for kind in Drawer::ALL {
             if !self.drawers[kind.index()].expanded {
                 continue;
             }
             let lines = match kind {
+                Drawer::PullRequest => Ok(herdr_sidebar::forge::pr_lines(git.root(), &branch)),
                 Drawer::Graph => git.graph(DRAWER_LIMIT),
                 Drawer::Commits => git.commits(DRAWER_LIMIT),
                 Drawer::FileHistory => match &self.history_target {
@@ -2203,6 +2219,10 @@ impl App {
                 MenuEntry::Action(MenuAction::CopyRef, "Copy Path"),
                 MenuEntry::Separator,
                 MenuEntry::Action(MenuAction::RemoveWorktree, "Remove Worktree…"),
+            ],
+            DrawerRef::Forge(_) => vec![
+                MenuEntry::Action(MenuAction::ShowRef, "Open"),
+                MenuEntry::Action(MenuAction::CopyRef, "Copy Number"),
             ],
             DrawerRef::None => return,
         };
@@ -3026,6 +3046,7 @@ impl App {
             DrawerRef::Remote { name, .. } => name.clone(),
             DrawerRef::Tag(t) => t.clone(),
             DrawerRef::Worktree(p) => p.clone(),
+            DrawerRef::Forge(_) => drawer_spec(&dref).unwrap_or_default(),
             DrawerRef::None => return,
         };
         let git_spec = drawer_git_spec(&dref).unwrap_or_else(|| spec.clone());
@@ -3187,6 +3208,26 @@ impl App {
         let Some(repo) = self.repos.get(self.active) else {
             return;
         };
+        if let Some(DrawerRef::Forge(item)) = self.drawers[kind.index()].refs.get(index) {
+            // ponytail: blocks the UI on `gh` for a second; move off-thread if it bothers.
+            let result =
+                herdr_sidebar::forge::write_markdown(repo.git.root(), *item).and_then(|path| {
+                    let doc_key = herdr_sidebar::viewer::doc_key_for_file(&path);
+                    let payload = herdr_sidebar::viewer::file_request(&path);
+                    herdr_sidebar::viewer::open_in_pane(
+                        &pane_id,
+                        repo.git.root(),
+                        &doc_key,
+                        &payload,
+                    )
+                    .map(|target| (doc_key, target))
+                });
+            match result {
+                Ok(last) => self.last_preview = Some(last),
+                Err(e) => self.flash = Some((e, true)),
+            }
+            return;
+        }
         let Some(spec) = self.drawers[kind.index()]
             .refs
             .get(index)
@@ -5862,6 +5903,7 @@ mod tests {
         assert_eq!(
             titles,
             [
+                "Pull Request",
                 "Graph",
                 "Commits",
                 "File History",
