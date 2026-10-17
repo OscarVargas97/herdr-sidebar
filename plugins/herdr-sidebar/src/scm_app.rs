@@ -81,7 +81,6 @@ enum Focus {
 /// The Git-Graph-style drawers below the Changes section.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Drawer {
-    PullRequest,
     Graph,
     Commits,
     FileHistory,
@@ -90,11 +89,15 @@ enum Drawer {
     Remotes,
     Stashes,
     Tags,
+    // The GitHub activity's sections.
+    Works,
+    PullRequests,
+    Issues,
 }
 
 impl Drawer {
-    const ALL: [Drawer; 9] = [
-        Drawer::PullRequest,
+    /// Source Control's Git drawers.
+    const ALL: [Drawer; 8] = [
         Drawer::Graph,
         Drawer::Commits,
         Drawer::FileHistory,
@@ -104,10 +107,11 @@ impl Drawer {
         Drawer::Stashes,
         Drawer::Tags,
     ];
+    /// The GitHub activity's sections.
+    const GITHUB: [Drawer; 3] = [Drawer::Works, Drawer::PullRequests, Drawer::Issues];
 
     fn title(self) -> &'static str {
         match self {
-            Drawer::PullRequest => "Pull Request",
             Drawer::Graph => "Graph",
             Drawer::Commits => "Commits",
             Drawer::FileHistory => "File History",
@@ -116,11 +120,18 @@ impl Drawer {
             Drawer::Remotes => "Remotes",
             Drawer::Stashes => "Stashes",
             Drawer::Tags => "Tags",
+            Drawer::Works => "Works",
+            Drawer::PullRequests => "Pull Requests",
+            Drawer::Issues => "Issues",
         }
     }
 
     fn index(self) -> usize {
-        Drawer::ALL.iter().position(|d| *d == self).unwrap_or(0)
+        Drawer::ALL
+            .iter()
+            .chain(&Drawer::GITHUB)
+            .position(|d| *d == self)
+            .unwrap_or(0)
     }
 }
 
@@ -130,6 +141,8 @@ struct DrawerPanel {
     lines: Vec<String>,
     /// What each line points at, parallel to `lines`.
     refs: Vec<DrawerRef>,
+    /// How GitHub lines are drawn, parallel to `lines` (empty for Git drawers).
+    tones: Vec<herdr_sidebar::forge::Tone>,
 }
 
 /// What a drawer line points at, for clicks and context menus.
@@ -152,8 +165,8 @@ enum DrawerRef {
     Tag(String),
     /// A worktree's checkout path.
     Worktree(String),
-    /// The branch's pull request or an issue it closes.
-    Forge(herdr_sidebar::forge::Item),
+    /// A PR, an issue or a work's ESTADO.md (GitHub activity).
+    Link(herdr_sidebar::forge::Link),
 }
 
 /// Parse the actionable reference out of one drawer line.
@@ -210,9 +223,8 @@ fn pretty_remote_url(url: &str) -> String {
 
 fn parse_drawer_ref(kind: Drawer, line: &str) -> DrawerRef {
     match kind {
-        Drawer::PullRequest => herdr_sidebar::forge::parse_ref(line)
-            .map(DrawerRef::Forge)
-            .unwrap_or(DrawerRef::None),
+        // GitHub lines carry their link from forge, never parsed.
+        Drawer::Works | Drawer::PullRequests | Drawer::Issues => DrawerRef::None,
         Drawer::Graph | Drawer::Commits | Drawer::FileHistory => line
             .split_whitespace()
             .find(|tok| {
@@ -277,9 +289,10 @@ fn drawer_spec(dref: &DrawerRef) -> Option<String> {
         DrawerRef::Tag(t) => Some(t.clone()),
         DrawerRef::Remote { name, .. } => Some(name.clone()),
         DrawerRef::Worktree(p) => Some(p.clone()),
-        DrawerRef::Forge(
-            herdr_sidebar::forge::Item::Pr(n) | herdr_sidebar::forge::Item::Issue(n),
+        DrawerRef::Link(
+            herdr_sidebar::forge::Link::Pr(_, n) | herdr_sidebar::forge::Link::Issue(_, n),
         ) => Some(format!("#{n}")),
+        DrawerRef::Link(herdr_sidebar::forge::Link::File(path)) => Some(path.display().to_string()),
         DrawerRef::None => None,
     }
 }
@@ -822,6 +835,7 @@ struct ClickZones {
     explorer: (u16, u16),
     search: (u16, u16),
     source_control: (u16, u16),
+    github: (u16, u16),
     /// The ⚙ button (activity bar in unified mode, header otherwise).
     gear: Rect,
     message: Rect,
@@ -944,7 +958,9 @@ pub struct App {
     snap: bool,
     focus: Focus,
     theme: IconTheme,
-    drawers: [DrawerPanel; 9],
+    drawers: [DrawerPanel; 11],
+    /// The GitHub activity (Works, Pull Requests, Issues) instead of Git.
+    github: bool,
     /// The file the FILE HISTORY drawer follows: the last selected file row.
     history_target: Option<String>,
     /// One-shot footer notice: (text, is_error). Cleared on the next key press.
@@ -1038,10 +1054,18 @@ impl App {
         // One source of truth: the global setting, so every pane and every
         // folder agrees (a per-folder copy used to override it forever).
         let tree_view = sidebar_state.scm_tree_view;
-        let mut drawers: [DrawerPanel; 9] = Default::default();
+        let mut drawers: [DrawerPanel; 11] = Default::default();
         for kind in Drawer::ALL {
             drawers[kind.index()].expanded = saved.drawers.iter().any(|d| d == kind.title());
         }
+        // GitHub sections start open; a collapsed one is saved as "-Title".
+        for kind in Drawer::GITHUB {
+            drawers[kind.index()].expanded = !saved
+                .drawers
+                .iter()
+                .any(|d| *d == format!("-{}", kind.title()));
+        }
+        let github = sidebar_state.github_active;
         let active = saved
             .active_root
             .as_deref()
@@ -1087,6 +1111,7 @@ impl App {
             focus: Focus::List,
             theme,
             drawers,
+            github,
             history_target,
             flash: None,
             suggesting: None,
@@ -1375,6 +1400,12 @@ impl App {
             }
         }
         if !self.background_refresh && !self.pane_is_focused() {
+            // Works and agent states are worth watching from another pane;
+            // they are cheap (files, pane.list, the forge cache).
+            if self.github {
+                self.reload_expanded_drawers();
+                self.rebuild();
+            }
             return;
         }
         if self.repos.is_empty() {
@@ -1441,20 +1472,20 @@ impl App {
     }
 
     fn reload_expanded_drawers(&mut self) {
+        if self.github {
+            self.reload_github();
+            return;
+        }
         let Some(git) = self.active_repo().map(|r| r.git.clone()) else {
             return;
         };
         let git = &git;
-        let branch = self
-            .active_repo()
-            .map(|r| r.status.branch.clone())
-            .unwrap_or_default();
         for kind in Drawer::ALL {
             if !self.drawers[kind.index()].expanded {
                 continue;
             }
             let lines = match kind {
-                Drawer::PullRequest => Ok(herdr_sidebar::forge::pr_lines(git.root(), &branch)),
+                Drawer::Works | Drawer::PullRequests | Drawer::Issues => continue,
                 Drawer::Graph => git.graph(DRAWER_LIMIT),
                 Drawer::Commits => git.commits(DRAWER_LIMIT),
                 Drawer::FileHistory => match &self.history_target {
@@ -1494,8 +1525,77 @@ impl App {
         }
     }
 
+    /// The GitHub sections over every visible repo (forge caches `gh`).
+    fn reload_github(&mut self) {
+        let mut checkouts: Vec<(PathBuf, String)> = self
+            .repos
+            .iter()
+            .map(|r| (r.git.root().to_path_buf(), r.status.branch.clone()))
+            .collect();
+        // A space's worktrees sit deeper than the Source Control scan.
+        for (dir, branch) in herdr_sidebar::forge::space_checkouts(&self.cwd) {
+            let key = sidebar::scm_path_key(&dir);
+            if !checkouts
+                .iter()
+                .any(|(r, _)| sidebar::scm_path_key(r) == key)
+            {
+                checkouts.push((dir, branch));
+            }
+        }
+        let roots: Vec<PathBuf> = checkouts.iter().map(|(r, _)| r.clone()).collect();
+        for kind in Drawer::GITHUB {
+            if !self.drawers[kind.index()].expanded {
+                continue;
+            }
+            let items = match kind {
+                Drawer::Works => herdr_sidebar::forge::works(&self.cwd, &checkouts),
+                Drawer::PullRequests => herdr_sidebar::forge::pulls(&roots),
+                _ => herdr_sidebar::forge::issues(&roots),
+            };
+            let panel = &mut self.drawers[kind.index()];
+            panel.lines = items.iter().map(|i| i.text.clone()).collect();
+            panel.tones = items.iter().map(|i| i.tone).collect();
+            panel.refs = items
+                .into_iter()
+                .map(|i| i.link.map_or(DrawerRef::None, DrawerRef::Link))
+                .collect();
+        }
+    }
+
+    /// Switch between Source Control and its GitHub activity in-process.
+    fn set_github(&mut self, on: bool) -> Option<Exit> {
+        if self.github != on {
+            self.github = on;
+            self.focus = Focus::List;
+            self.selected = None;
+            self.hovered = None;
+            self.scroll = 0;
+            if self.merged() {
+                self.sidebar_state = sidebar::update_state(|state| state.github_active = on);
+            }
+            self.reload_expanded_drawers();
+            self.rebuild();
+        }
+        None
+    }
+
     fn rebuild(&mut self) {
         self.rows.clear();
+        if self.github {
+            for kind in Drawer::GITHUB {
+                self.rows.push(Row::DrawerHeader(kind));
+                if self.drawers[kind.index()].expanded {
+                    for i in 0..self.drawers[kind.index()].lines.len() {
+                        self.rows.push(Row::DrawerLine(kind, i));
+                    }
+                }
+            }
+            if let Some(sel) = self.selected {
+                self.selected = Some(sel.min(self.rows.len() - 1));
+            }
+            self.scroll = self.scroll.min(self.rows.len() - 1);
+            return;
+        }
         let multi = self.repos.len() > 1;
         if self.tree_view {
             for repo in &mut self.repos {
@@ -1659,7 +1759,7 @@ impl App {
             _ => None,
         };
         let keyboard_view = match key.code {
-            KeyCode::Char(c @ ('1' | '2' | '3'))
+            KeyCode::Char(c @ ('1' | '2' | '3' | '4'))
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
             {
@@ -1672,7 +1772,8 @@ impl App {
             return match c {
                 '1' => self.switch_to(View::Explorer),
                 '2' => self.open_search(false),
-                _ => self.switch_to(View::SourceControl),
+                '3' => self.set_github(false),
+                _ => self.set_github(true),
             };
         }
         if self.overlay.is_some() {
@@ -1753,6 +1854,21 @@ impl App {
     }
 
     fn on_list_key(&mut self, key: KeyEvent) -> Option<Exit> {
+        // Commit-box and staging keys mean nothing in the GitHub activity.
+        if self.github
+            && matches!(
+                key.code,
+                KeyCode::Tab
+                    | KeyCode::BackTab
+                    | KeyCode::Char('c' | 't' | 'a' | 'u' | 'A' | 'S' | 'o')
+            )
+        {
+            return None;
+        }
+        if self.github && key.code == KeyCode::Char('r') {
+            herdr_sidebar::forge::invalidate();
+            self.flash = Some(("actualizando GitHub…".into(), false));
+        }
         match key.code {
             KeyCode::Char('q') => return Some(Exit::Quit),
             // Esc never quits the sidebar — it closes the preview instead.
@@ -1782,7 +1898,8 @@ impl App {
             KeyCode::Char('b') => self.hide(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => return self.open_search(false),
-            KeyCode::Char('3') => return self.switch_to(View::SourceControl),
+            KeyCode::Char('3') => return self.set_github(false),
+            KeyCode::Char('4') => return self.set_github(true),
             _ => {}
         }
         None
@@ -1832,7 +1949,10 @@ impl App {
                 return self.open_search(false);
             }
             if hits_activity_button(z.source_control, z.activity_row, x, y) {
-                return self.switch_to(View::SourceControl);
+                return self.set_github(false);
+            }
+            if hits_activity_button(z.github, z.activity_row, x, y) {
+                return self.set_github(true);
             }
         }
         if hits(z.gear, x, y) {
@@ -2221,7 +2341,11 @@ impl App {
                 MenuEntry::Separator,
                 MenuEntry::Action(MenuAction::RemoveWorktree, "Remove Worktree…"),
             ],
-            DrawerRef::Forge(_) => vec![
+            DrawerRef::Link(herdr_sidebar::forge::Link::File(_)) => vec![
+                MenuEntry::Action(MenuAction::ShowRef, "Open"),
+                MenuEntry::Action(MenuAction::CopyRef, "Copy Path"),
+            ],
+            DrawerRef::Link(_) => vec![
                 MenuEntry::Action(MenuAction::ShowRef, "Open"),
                 MenuEntry::Action(MenuAction::OpenInBrowser, "Open in Browser"),
                 MenuEntry::Action(MenuAction::CopyRef, "Copy Number"),
@@ -3048,15 +3172,15 @@ impl App {
             DrawerRef::Remote { name, .. } => name.clone(),
             DrawerRef::Tag(t) => t.clone(),
             DrawerRef::Worktree(p) => p.clone(),
-            DrawerRef::Forge(_) => drawer_spec(&dref).unwrap_or_default(),
+            DrawerRef::Link(_) => drawer_spec(&dref).unwrap_or_default(),
             DrawerRef::None => return,
         };
         let git_spec = drawer_git_spec(&dref).unwrap_or_else(|| spec.clone());
         match action {
             MenuAction::ShowRef => self.open_drawer_ref(kind, index),
             MenuAction::OpenInBrowser => {
-                if let (DrawerRef::Forge(item), Some(r)) = (&dref, self.repos.get(repo))
-                    && let Err(e) = herdr_sidebar::forge::open_web(r.git.root(), *item)
+                if let DrawerRef::Link(link) = &dref
+                    && let Err(e) = herdr_sidebar::forge::open_web(link)
                 {
                     self.flash = Some((e, true));
                 }
@@ -3214,29 +3338,24 @@ impl App {
             self.flash = Some(("preview needs a herdr pane".into(), true));
             return;
         };
+        if let Some(DrawerRef::Link(link)) = self.drawers[kind.index()].refs.get(index).cloned() {
+            // `gh` takes a second or two: fetch and open off the UI thread.
+            let cwd = self.cwd.clone();
+            if !matches!(link, herdr_sidebar::forge::Link::File(_)) {
+                self.flash = Some(("abriendo…".into(), false));
+            }
+            std::thread::spawn(move || {
+                let _ = herdr_sidebar::forge::write_markdown(&link).and_then(|path| {
+                    let doc_key = herdr_sidebar::viewer::doc_key_for_file(&path);
+                    let payload = herdr_sidebar::viewer::file_request(&path);
+                    herdr_sidebar::viewer::open_in_pane(&pane_id, &cwd, &doc_key, &payload)
+                });
+            });
+            return;
+        }
         let Some(repo) = self.repos.get(self.active) else {
             return;
         };
-        if let Some(DrawerRef::Forge(item)) = self.drawers[kind.index()].refs.get(index) {
-            // ponytail: blocks the UI on `gh` for a second; move off-thread if it bothers.
-            let result =
-                herdr_sidebar::forge::write_markdown(repo.git.root(), *item).and_then(|path| {
-                    let doc_key = herdr_sidebar::viewer::doc_key_for_file(&path);
-                    let payload = herdr_sidebar::viewer::file_request(&path);
-                    herdr_sidebar::viewer::open_in_pane(
-                        &pane_id,
-                        repo.git.root(),
-                        &doc_key,
-                        &payload,
-                    )
-                    .map(|target| (doc_key, target))
-                });
-            match result {
-                Ok(last) => self.last_preview = Some(last),
-                Err(e) => self.flash = Some((e, true)),
-            }
-            return;
-        }
         let Some(spec) = self.drawers[kind.index()]
             .refs
             .get(index)
@@ -3408,6 +3527,12 @@ impl App {
             .iter()
             .filter(|k| self.drawers[k.index()].expanded)
             .map(|k| k.title().to_string())
+            .chain(
+                Drawer::GITHUB
+                    .iter()
+                    .filter(|k| !self.drawers[k.index()].expanded)
+                    .map(|k| format!("-{}", k.title())),
+            )
             .collect();
         let active_root = self
             .repos
@@ -4062,7 +4187,8 @@ impl App {
         // INSIDE each repo's section (rendered as list rows); the single-repo
         // view keeps them fixed at the top. The Sync Changes row only appears
         // when there is something to sync (or a sync is running).
-        let multi = self.multi();
+        // The GitHub activity has no commit box: lay it out like multi-repo.
+        let multi = self.multi() || self.github;
         let message_height = if multi {
             0
         } else {
@@ -4205,7 +4331,7 @@ impl App {
         let outer_top = area.y;
         let outer_bottom = area.y + 2;
         let area = Rect::new(area.x, area.y + 1, area.width, 1);
-        let (exp_icon, search_icon, git_icon) = activity_icons(self.theme);
+        let (exp_icon, search_icon, git_icon, github_icon) = activity_icons(self.theme);
         // Both FA glyphs (folder, code-fork) render two cells wide in the
         // non-Mono Nerd Font; reserve the second cell in each chip so the
         // highlights are equal-sized with centered icons.
@@ -4221,6 +4347,8 @@ impl App {
             Span::raw(format!(" {search_icon}{slack} ")),
             Span::raw(" "),
             Span::raw(format!(" {git_icon}{slack} ")),
+            Span::raw(" "),
+            Span::raw(format!(" {github_icon}{slack} ")),
         ];
         // Hit zones from the actual span widths (emoji vs nerd-glyph widths differ).
         let mut x = area.x;
@@ -4234,6 +4362,7 @@ impl App {
         self.zones.explorer = bounds[1];
         self.zones.search = bounds[3];
         self.zones.source_control = bounds[5];
+        self.zones.github = bounds[7];
         let hovered = |bounds| {
             self.mouse_pos
                 .is_some_and(|(x, y)| hits_activity_button(bounds, area.y, x, y))
@@ -4241,19 +4370,28 @@ impl App {
         let explorer_hovered = hovered(bounds[1]);
         let search_hovered = hovered(bounds[3]);
         let git_hovered = hovered(bounds[5]);
+        let github_hovered = hovered(bounds[7]);
+        let (active, idle, idle_hovered) = if self.github {
+            (7, 5, git_hovered)
+        } else {
+            (5, 7, github_hovered)
+        };
         spans[1].style = activity_button_style(false, explorer_hovered);
         spans[3].style = activity_button_style(false, search_hovered);
-        spans[5].style = activity_button_style(true, git_hovered);
+        spans[5].style = activity_button_style(!self.github, git_hovered);
+        spans[7].style = activity_button_style(self.github, github_hovered);
         draw_activity_caps(
             frame,
-            bounds[5],
+            bounds[active],
             outer_top,
             outer_bottom,
             palette().selection_bg,
         );
-        for (is_hovered, button_bounds) in
-            [(explorer_hovered, bounds[1]), (search_hovered, bounds[3])]
-        {
+        for (is_hovered, button_bounds) in [
+            (explorer_hovered, bounds[1]),
+            (search_hovered, bounds[3]),
+            (idle_hovered, bounds[idle]),
+        ] {
             if is_hovered {
                 draw_activity_caps(
                     frame,
@@ -4295,6 +4433,7 @@ impl App {
         // rows (the sections inside are already Changes/Staged Changes);
         // several repos fall back to a neutral "Source Control".
         let title = match self.active_repo() {
+            _ if self.github => "GitHub".to_string(),
             Some(repo) if self.repos.len() == 1 => repo.name.clone(),
             _ => "Source Control".to_string(),
         };
@@ -4302,6 +4441,7 @@ impl App {
         // With several repos visible, the header names the one the commit box
         // and sync act on; a single repo shows branch + ahead/behind arrows.
         let right_text = match self.active_repo() {
+            _ if self.github => String::new(),
             Some(repo) if self.repos.len() > 1 => {
                 format!("{} · {} ", repo.name, repo.status.branch)
             }
@@ -4597,7 +4737,8 @@ impl App {
                         item
                     }
                     Row::DrawerLine(kind, i) => {
-                        drawer_line(kind, &self.drawers[kind.index()].lines[i])
+                        let panel = &self.drawers[kind.index()];
+                        drawer_line(kind, &panel.lines[i], panel.tones.get(i).copied())
                     }
                     Row::StagedDir(r, d) => {
                         let dir = &self.repos[r].staged_dirs[d];
@@ -5333,9 +5474,19 @@ fn file_history_header(collapsed: bool, file: &str) -> ListItem<'static> {
 
 /// One content line inside an expanded drawer. Branch lines highlight the
 /// current branch (git's `%(HEAD)` renders it as `* name`).
-fn drawer_line(kind: Drawer, text: &str) -> ListItem<'static> {
-    let style = match kind {
-        Drawer::Branches if text.starts_with('*') => {
+fn drawer_line(
+    kind: Drawer,
+    text: &str,
+    tone: Option<herdr_sidebar::forge::Tone>,
+) -> ListItem<'static> {
+    use herdr_sidebar::forge::Tone;
+    let style = match (kind, tone) {
+        (_, Some(Tone::Group)) => Style::default().fg(palette().header_accent).bold(),
+        (_, Some(Tone::Working)) => Style::default().fg(palette().untracked).bold(),
+        (_, Some(Tone::Head)) if kind == Drawer::Works => Style::default().bold(),
+        (_, Some(Tone::Meta)) => Style::default().fg(Color::DarkGray),
+        (_, Some(Tone::Note)) => Style::default().fg(Color::DarkGray).italic(),
+        (Drawer::Branches, _) if text.starts_with('*') => {
             Style::default().fg(palette().untracked).bold()
         }
         _ => Style::default(),
@@ -5912,7 +6063,6 @@ mod tests {
         assert_eq!(
             titles,
             [
-                "Pull Request",
                 "Graph",
                 "Commits",
                 "File History",
