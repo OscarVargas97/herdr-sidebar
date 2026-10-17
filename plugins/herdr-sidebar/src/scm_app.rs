@@ -676,6 +676,7 @@ enum MenuAction {
     CopyRef,
     DeleteTag,
     RemoveWorktree,
+    OpenInBrowser,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2222,6 +2223,7 @@ impl App {
             ],
             DrawerRef::Forge(_) => vec![
                 MenuEntry::Action(MenuAction::ShowRef, "Open"),
+                MenuEntry::Action(MenuAction::OpenInBrowser, "Open in Browser"),
                 MenuEntry::Action(MenuAction::CopyRef, "Copy Number"),
             ],
             DrawerRef::None => return,
@@ -3052,6 +3054,13 @@ impl App {
         let git_spec = drawer_git_spec(&dref).unwrap_or_else(|| spec.clone());
         match action {
             MenuAction::ShowRef => self.open_drawer_ref(kind, index),
+            MenuAction::OpenInBrowser => {
+                if let (DrawerRef::Forge(item), Some(r)) = (&dref, self.repos.get(repo))
+                    && let Err(e) = herdr_sidebar::forge::open_web(r.git.root(), *item)
+                {
+                    self.flash = Some((e, true));
+                }
+            }
             MenuAction::Reveal => reveal(std::path::Path::new(&spec), true),
             MenuAction::RemoveWorktree => self.confirm_git(
                 repo,
