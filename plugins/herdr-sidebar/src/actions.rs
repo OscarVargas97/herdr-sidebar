@@ -120,9 +120,71 @@ pub fn delete(path: &Path, is_dir: bool) -> io::Result<()> {
     }
 }
 
-/// Copy text to the system clipboard by piping to the platform's clipboard
-/// tool (a console child of the TUI's own pty — no window is created).
-pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
+/// Which path [`copy_to_clipboard`] took, so a caller can word its notice
+/// accordingly: a native tool's exit status is a real confirmation, while an
+/// OSC 52 write is not (the terminal never acknowledges it).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClipboardWrite {
+    Native,
+    Osc52Unacknowledged,
+}
+
+/// herdr's libghostty-vt OSC parser caps a captured OSC 52 payload at 8 MiB
+/// (`Parser.MAX_ALLOCATING_BUF` in `terminal/osc.zig`). The captured span
+/// starts right after the "52;" prefix (which is consumed by the parser's
+/// state machine and never itself counted) and holds the kind + separator
+/// ("c;", 2 bytes), the base64 payload, and a trailing NUL byte the parser
+/// appends once the sequence ends (`terminal/osc/parsers/clipboard_operation.zig`,
+/// `cap.writeByte(0)`). A larger sequence never reaches the clipboard, so
+/// reject it up front rather than writing a truncated payload the client
+/// can't decode.
+const OSC52_MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Copy text to the system clipboard.
+///
+/// Over SSH there is often no local clipboard tool to shell out to, so this
+/// emits an OSC 52 sequence on stdout instead: herdr's own terminal emulator
+/// parses it out of the pane's PTY stream and forwards it to the attached
+/// client, which writes it to the real (possibly remote) clipboard — the
+/// same path core herdr's own selection-copy uses. Otherwise this first pipes
+/// to the platform's clipboard tool (a console child of the TUI's own pty —
+/// no window is created), then falls back to OSC 52 when stdout is a terminal.
+pub fn copy_to_clipboard(text: &str) -> io::Result<ClipboardWrite> {
+    if osc52_preferred() {
+        return write_osc52_stdout(text);
+    }
+    match copy_native(text) {
+        Ok(()) => Ok(ClipboardWrite::Native),
+        Err(_) if osc52_fallback_available() => write_osc52_stdout(text),
+        Err(err) => Err(err),
+    }
+}
+
+/// Over SSH there is no local clipboard tool to trust, so OSC 52 goes first.
+/// Mirrors core herdr's SSH presence check; deliberately narrower than its
+/// `should_prefer_osc52` (no WSL/VS Code detection — those aren't "we have
+/// no local clipboard tool" cases the way SSH is).
+pub fn osc52_preferred() -> bool {
+    #[cfg(not(windows))]
+    {
+        (std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some())
+            && std::io::IsTerminal::is_terminal(&std::io::stdout())
+    }
+    #[cfg(windows)]
+    {
+        false
+    }
+}
+
+/// Whether a failed native copy may fall back to OSC 52 (Unix, on a TTY).
+pub fn osc52_fallback_available() -> bool {
+    cfg!(not(windows)) && std::io::IsTerminal::is_terminal(&std::io::stdout())
+}
+
+/// Copy through the platform's clipboard tool (a console child of the TUI's
+/// own pty — no window is created). Blocks until the tool exits, so callers
+/// on a UI thread should run it on a worker.
+pub fn copy_native(text: &str) -> io::Result<()> {
     #[cfg(windows)]
     let candidates: &[&[&str]] = &[&["clip"]];
     #[cfg(not(windows))]
@@ -142,11 +204,103 @@ pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
     Err(last_err)
 }
 
+/// Emit OSC 52 on stdout. Must run on the thread that draws the TUI, or the
+/// escape sequence could interleave with a frame being written.
+pub fn write_osc52_stdout(text: &str) -> io::Result<ClipboardWrite> {
+    let stdout = io::stdout();
+    write_osc52(stdout.lock(), text)
+}
+
+fn write_osc52(mut out: impl std::io::Write, text: &str) -> io::Result<ClipboardWrite> {
+    if text.is_empty() {
+        // An empty OSC 52 payload clears the terminal's clipboard instead of
+        // leaving it untouched.
+        return Err(io::Error::other("nothing to copy"));
+    }
+    if !osc52_sequence_fits(text.len()) {
+        return Err(io::Error::other(
+            "selection too large for terminal clipboard (OSC 52 limit)",
+        ));
+    }
+    let encoded = base64_encode(text.as_bytes());
+    write!(out, "\x1b]52;c;{encoded}\x07")?;
+    out.flush()?;
+    Ok(ClipboardWrite::Osc52Unacknowledged)
+}
+
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard (RFC 4648, padded) base64 encoder. Hand-rolled so the OSC 52
+/// path doesn't need a new dependency for something this small.
+fn base64_encode(bytes: &[u8]) -> String {
+    // A precise capacity is just a preallocation hint here (the caller has
+    // already validated the length via `osc52_sequence_fits`); 0 is always a
+    // safe fallback if it were ever to overflow, not a claim about the real
+    // encoded length.
+    let capacity = checked_base64_encoded_len(bytes.len()).unwrap_or(0);
+    let mut out = String::with_capacity(capacity);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied();
+        let b2 = chunk.get(2).copied();
+        out.push(BASE64_ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(BASE64_ALPHABET[(((b0 & 0x03) << 4) | (b1.unwrap_or(0) >> 4)) as usize] as char);
+        out.push(match b1 {
+            Some(b1) => {
+                BASE64_ALPHABET[(((b1 & 0x0f) << 2) | (b2.unwrap_or(0) >> 6)) as usize] as char
+            }
+            None => '=',
+        });
+        out.push(match b2 {
+            Some(b2) => BASE64_ALPHABET[(b2 & 0x3f) as usize] as char,
+            None => '=',
+        });
+    }
+    out
+}
+
+/// The base64-encoded length of `input_len` raw bytes (RFC 4648 padded:
+/// `ceil(input_len / 3) * 4`), or `None` if computing it would overflow
+/// `usize`.
+fn checked_base64_encoded_len(input_len: usize) -> Option<usize> {
+    input_len.checked_add(2)?.checked_div(3)?.checked_mul(4)
+}
+
+/// Whether `input_len` raw bytes, once base64-encoded, fit inside herdr's
+/// libghostty-vt OSC 52 capture limit (see [`OSC52_MAX_CAPTURE_BYTES`])
+/// alongside the "c;" kind prefix and the trailing NUL the parser appends.
+/// Factored out (and worked on the byte count, before encoding) so the
+/// boundary can be tested without allocating or emitting real escape
+/// sequences, and so a pathological length can't be encoded just to be
+/// rejected. Uses checked arithmetic throughout rather than a sentinel
+/// fallback, so an overflow is reported as "doesn't fit" instead of being
+/// silently misrepresented as a real length.
+fn osc52_sequence_fits(input_len: usize) -> bool {
+    // The capture holds "c;" (2 bytes) then the base64 payload, then the
+    // parser appends one trailing NUL once the OSC sequence ends.
+    const KIND_PREFIX_BYTES: usize = 2;
+    const TRAILING_NUL_BYTES: usize = 1;
+    let Some(encoded_len) = checked_base64_encoded_len(input_len) else {
+        return false;
+    };
+    let Some(total) = encoded_len
+        .checked_add(KIND_PREFIX_BYTES)
+        .and_then(|t| t.checked_add(TRAILING_NUL_BYTES))
+    else {
+        return false;
+    };
+    total <= OSC52_MAX_CAPTURE_BYTES
+}
+
+/// How long a clipboard helper may take before it is killed. `clip` and
+/// friends exit in milliseconds; one that hangs must not wedge its caller.
+const CLIPBOARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn copy_with(argv: &[&str], text: &str) -> io::Result<()> {
     use std::io::Write;
 
-    let mut child = std::process::Command::new(argv[0])
-        .args(&argv[1..])
+    let mut child = clipboard_command(argv)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -157,9 +311,53 @@ fn copy_with(argv: &[&str], text: &str) -> io::Result<()> {
             format!("{} opened without stdin", argv[0]),
         ));
     };
-    stdin.write_all(text.as_bytes())?;
-    drop(stdin);
-    let status = child.wait()?;
+    // Write on a helper thread: a helper that never reads would block the
+    // write forever once the pipe buffer fills. One deadline covers BOTH the
+    // delivery and the exit, and the copy only counts when every byte was
+    // delivered AND the helper succeeded — callers such as the editor's cut
+    // delete text on success, and there is no undo.
+    let bytes = text.as_bytes().to_vec();
+    let (sent, delivery) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = stdin.write_all(&bytes);
+        drop(stdin);
+        let _ = sent.send(result);
+    });
+    let deadline = std::time::Instant::now() + CLIPBOARD_TIMEOUT;
+    let mut delivered: Option<io::Result<()>> = None;
+    let mut exited = None;
+    loop {
+        if delivered.is_none() {
+            match delivery.try_recv() {
+                Ok(result) => delivered = Some(result),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    delivered = Some(Err(io::Error::other("clipboard writer failed")));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if exited.is_none() {
+            exited = child.try_wait()?;
+        }
+        if let (Some(_), Some(_)) = (&delivered, &exited) {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            // A descendant that inherited the pipe can outlive the helper;
+            // the writer thread is then abandoned rather than awaited.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{} did not finish in time", argv[0]),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let (Some(delivered), Some(status)) = (delivered, exited) else {
+        unreachable!("the loop only exits with both outcomes");
+    };
+    delivered.map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", argv[0])))?;
     if status.success() {
         Ok(())
     } else {
@@ -168,6 +366,19 @@ fn copy_with(argv: &[&str], text: &str) -> io::Result<()> {
             argv[0]
         )))
     }
+}
+
+/// A clipboard helper process. Windows PowerShell children must not inherit
+/// a PowerShell 7 `PSModulePath` (issue #96): 5.1 would autoload PS7's
+/// CoreCLR modules and lose `Get-Clipboard`. Without the variable, 5.1 uses
+/// its own defaults.
+fn clipboard_command(argv: &[&str]) -> std::process::Command {
+    let mut command = std::process::Command::new(argv[0]);
+    command.args(&argv[1..]);
+    if argv[0].eq_ignore_ascii_case("powershell") {
+        command.env_remove("PSModulePath");
+    }
+    command
 }
 
 /// Read text from the system clipboard when a platform clipboard command is
@@ -192,10 +403,7 @@ pub fn paste_from_clipboard() -> io::Result<String> {
 
     let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no clipboard tool found");
     for argv in candidates {
-        match std::process::Command::new(argv[0])
-            .args(&argv[1..])
-            .output()
-        {
+        match clipboard_command(argv).output() {
             Ok(output) if output.status.success() => {
                 return String::from_utf8(output.stdout)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
@@ -850,5 +1058,83 @@ mod tests {
         delete(&folder, true).unwrap();
         assert!(!renamed.exists() && !folder.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Astra round 3 HIGH: a helper that exits 0 without reading its input
+    /// did NOT copy. Reporting success would let the editor's cut delete the
+    /// selection with nothing on the clipboard.
+    #[test]
+    fn a_helper_that_ignores_its_input_is_not_a_successful_copy() {
+        let big = "x".repeat(4 * 1024 * 1024);
+        #[cfg(unix)]
+        let argv: &[&str] = &["sh", "-c", "exit 0"];
+        #[cfg(windows)]
+        let argv: &[&str] = &["cmd", "/c", "exit 0"];
+        assert!(
+            copy_with(argv, &big).is_err(),
+            "undelivered input must fail"
+        );
+    }
+
+    #[test]
+    fn powershell_clipboard_helpers_drop_an_inherited_module_path() {
+        let command = clipboard_command(&["powershell", "-NoProfile"]);
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == "PSModulePath" && value.is_none()),
+            "PSModulePath must be removed for Windows PowerShell children"
+        );
+        assert!(clipboard_command(&["clip"]).get_envs().next().is_none());
+    }
+
+    #[test]
+    fn base64_matches_rfc4648_test_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_handles_unicode_and_embedded_nul_bytes() {
+        // Cross-checked against the shell: `printf '%s' 'héllo→✓' | base64`.
+        assert_eq!(base64_encode("héllo→✓".as_bytes()), "aMOpbGxv4oaS4pyT");
+        // `printf 'a\x00b' | base64`.
+        assert_eq!(base64_encode(b"a\x00b"), "YQBi");
+    }
+
+    #[test]
+    fn osc52_size_check_accepts_up_to_the_limit_and_rejects_past_it() {
+        // libghostty-vt's capture holds "c;" (2 bytes) + the base64 payload
+        // + a trailing NUL (1 byte) within OSC52_MAX_CAPTURE_BYTES
+        // (8_388_608), so the payload budget is 8_388_608 - 3 == 8_388_605
+        // bytes. Base64 output length is always a multiple of 4, so the
+        // largest encoded length that fits is
+        // floor(8_388_605 / 4) * 4 == 2_097_151 * 4 == 8_388_604, i.e.
+        // ceil(n / 3) == 2_097_151; the largest raw n giving that is
+        // 3 * 2_097_151 == 6_291_453.
+        const MAX_FITTING_LEN: usize = 6_291_453;
+        assert!(osc52_sequence_fits(MAX_FITTING_LEN));
+        assert!(!osc52_sequence_fits(MAX_FITTING_LEN + 1));
+    }
+
+    #[test]
+    fn osc52_size_check_rejects_usize_max_without_panicking() {
+        assert!(!osc52_sequence_fits(usize::MAX));
+    }
+
+    #[test]
+    fn osc52_writer_emits_the_complete_terminal_sequence() {
+        let mut bytes = Vec::new();
+        assert_eq!(
+            write_osc52(&mut bytes, "hello").unwrap(),
+            ClipboardWrite::Osc52Unacknowledged
+        );
+        assert_eq!(bytes, b"\x1b]52;c;aGVsbG8=\x07");
+        assert!(write_osc52(Vec::new(), "").is_err());
     }
 }

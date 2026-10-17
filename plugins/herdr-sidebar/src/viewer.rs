@@ -43,26 +43,109 @@ const LOAD_POLL: Duration = Duration::from_millis(16);
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_LINES: usize = 5000;
 
+/// Body width from the most recent `draw_doc` call. Markdown loads happen on
+/// a worker before layout is available, so glow uses this snapshot and the
+/// event loop reloads a glow document if its actual body width differs.
+static LAST_BODY_WIDTH: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(80);
+
 /// Directory for the sidebar's private scratch files (viewer control files).
-/// `std::env::temp_dir()` can be a shared, world-writable directory (unix
-/// `/tmp`) where our filenames are predictable from the pane id; scope our
-/// files into a private, mode-0700 subdirectory so another local user can't
-/// plant a symlink at a path we're about to `fs::write` through. Windows'
-/// per-user `%TEMP%` needs no extra scoping.
+/// Lives in the plugin's per-user state dir (see `rundir`) rather than the
+/// shared OS temp dir, so another local user can never share it with us.
+/// Pure: does not create or chmod anything. Callers that are about to WRITE
+/// through a path under it must call `rundir::ensure_private` first.
 fn scratch_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join("herdr-sidebar-scratch");
-    let _ = std::fs::create_dir_all(&dir);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    crate::rundir::dir("scratch")
+}
+
+fn legacy_scratch_dir() -> PathBuf {
+    std::env::temp_dir().join("herdr-sidebar-scratch")
+}
+
+/// Is `path` a control file CONFINED to a recognized private scratch directory?
+/// The state-dir location is current; the old temp location remains accepted
+/// only when it still verifies as private, so already-running preview panes can
+/// survive one upgrade. Every
+/// control-file operation gates on this rather than trusting a path just
+/// because its immediate parent happens to be private — a metadata token can
+/// name any path, including one outside `scratch_dir()` that we also happen
+/// to own privately (an attacker's own `~/.ssh`, say, if it is 0700). Three
+/// checks, all re-verified fresh on every call:
+/// - `path`'s parent is LEXICALLY the expected directory — a plain path comparison,
+///   never `canonicalize`, which would follow a symlink and could make a
+///   symlinked scratch dir compare equal to somewhere it shouldn't.
+/// - that parent still verifies as `rundir::is_private` (ownership/mode can
+///   change between calls, not just at creation).
+/// - `path`'s final component is a plain filename (`Component::Normal`), not
+///   `.`/`..`/a root/a prefix: `scratch_dir().join("..")` has a parent EQUAL
+///   to `scratch_dir()` (`Path::parent` only strips the last component, it
+///   does not resolve `..`), so without this check that "file" would
+///   resolve outside `scratch_dir()` entirely.
+fn control_path_ok(path: &Path) -> bool {
+    control_path_ok_in(path, &scratch_dir()) || control_path_ok_in(path, &legacy_scratch_dir())
+}
+
+fn control_path_ok_in(path: &Path, expected_dir: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    parent == expected_dir
+        && crate::rundir::is_private(parent)
+        && matches!(
+            path.components().next_back(),
+            Some(std::path::Component::Normal(_))
+        )
+}
+
+/// Delete a control file, but only when it passes [`control_path_ok`] —
+/// never remove_file a path outside the confined scratch directory.
+fn remove_control_file(path: &Path) {
+    if control_path_ok(path) {
+        let _ = std::fs::remove_file(path);
     }
-    dir
+}
+
+#[cfg(all(test, unix))]
+fn remove_control_file_in(path: &Path, expected_dir: &Path) {
+    if control_path_ok_in(path, expected_dir) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// The error a control-file operation reports when [`control_path_ok`]
+/// refuses `path`.
+fn control_path_err(path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "control path {} is not confined to a private sidebar scratch directory (current: {})",
+            path.display(),
+            scratch_dir().display()
+        ),
+    )
 }
 
 /// Write `contents` to `path`, refusing to follow a pre-existing symlink at
-/// that location (defense in depth alongside `scratch_dir`'s 0700 perms).
+/// that location (defense in depth alongside the scratch dir's 0700 perms),
+/// and refusing to write at all unless `path` is confined to the private
+/// scratch directory.
 fn write_scratch_file(path: &Path, contents: &str) -> std::io::Result<()> {
+    if !control_path_ok(path) {
+        return Err(control_path_err(path));
+    }
+    let Some(parent) = path.parent() else {
+        return Err(control_path_err(path));
+    };
+    write_scratch_file_in(path, contents, parent)
+}
+
+pub(crate) fn write_scratch_file_in(
+    path: &Path,
+    contents: &str,
+    expected_dir: &Path,
+) -> std::io::Result<()> {
+    if !control_path_ok_in(path, expected_dir) {
+        return Err(control_path_err(path));
+    }
     if std::fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
@@ -102,9 +185,19 @@ fn control_token(control: &Path) -> String {
 }
 
 fn control_from_token(token: &str) -> PathBuf {
+    control_from_token_in(token, &scratch_dir(), &legacy_scratch_dir())
+}
+
+fn control_from_token_in(token: &str, current_dir: &Path, legacy_dir: &Path) -> PathBuf {
     let path = Path::new(token);
     if path.components().count() == 1 {
-        scratch_dir().join(path)
+        let current = current_dir.join(path);
+        let legacy = legacy_dir.join(path);
+        if !current.exists() && legacy.exists() && control_path_ok_in(&legacy, legacy_dir) {
+            legacy
+        } else {
+            current
+        }
     } else {
         path.to_path_buf()
     }
@@ -289,6 +382,9 @@ struct Doc {
     /// Long lines wrap unless the user toggles them off (`w`). Per document:
     /// a newly loaded one starts wrapped again.
     wrap: bool,
+    /// Width glow formatted this markdown document for. A mismatch with the
+    /// live body triggers one background reload instead of generic rewrap.
+    glow_width: Option<u16>,
     /// `lines` laid out for the pane, rebuilt only when the width or the
     /// wrap toggle changes (see [`Doc::relayout`]).
     rows: Vec<Row>,
@@ -299,6 +395,9 @@ struct Doc {
     /// row index underneath them changed.
     pending_src: Option<usize>,
     selection: PreviewSelection,
+    /// A file preview's modified-time/size stamp, taken on the load worker
+    /// BEFORE the content was read: the baseline later polls compare against.
+    stamp: Option<FileStamp>,
 }
 
 struct MediaPreview {
@@ -364,14 +463,15 @@ impl Doc {
         }
     }
 
-    fn on_mouse(&mut self, mouse: &MouseEvent, body: Rect) {
+    /// True when a mouse release finishes a non-empty selection.
+    fn on_mouse(&mut self, mouse: &MouseEvent, body: Rect) -> bool {
         if self.media.is_some() {
-            return;
+            return false;
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let Some(position) = self.text_position_at(body, mouse.column, mouse.row) else {
-                    return;
+                    return false;
                 };
                 let extending = mouse.modifiers.contains(KeyModifiers::SHIFT);
                 let anchor = if extending {
@@ -385,22 +485,26 @@ impl Doc {
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 let Some(anchor) = self.selection.mouse_anchor else {
-                    return;
+                    return false;
                 };
                 let Some(position) = self.text_position_at(body, mouse.column, mouse.row) else {
-                    return;
+                    return false;
                 };
                 self.selection.anchor = Some(anchor);
                 self.selection.cursor = Some(position);
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                if self.selection.mouse_anchor.take().is_none() {
+                    return false;
+                }
                 if let Some(position) = self.text_position_at(body, mouse.column, mouse.row) {
                     self.selection.cursor = Some(position);
                 }
-                self.selection.mouse_anchor = None;
+                return self.selection_range().is_some();
             }
             _ => {}
         }
+        false
     }
 
     fn text_position_at(&self, body: Rect, column: u16, row: u16) -> Option<RenderPos> {
@@ -665,12 +769,21 @@ fn load(request: &Request) -> Doc {
             media: None,
             scroll: 0,
             wrap: true,
+            glow_width: None,
             rows: Vec::new(),
             rows_key: None,
             pending_src: None,
             selection: PreviewSelection::default(),
+            stamp: None,
         },
-        Request::File { path, line } => load_file(path, *line),
+        Request::File { path, line } => {
+            // Stat before reading: a write that lands during the read leaves
+            // the stamp behind the content, so the next poll reloads again.
+            let stamp = file_stamp(path);
+            let mut doc = load_file(path, *line);
+            doc.stamp = stamp;
+            doc
+        }
         Request::Diff { root, rel, kind } => load_diff(root, rel, kind),
         Request::Show { root, spec, path } => load_show(root, spec, path.as_deref()),
     }
@@ -702,14 +815,27 @@ fn loading_doc(request: &Request) -> Doc {
         media: None,
         scroll: 0,
         wrap: true,
+        glow_width: None,
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
         selection: PreviewSelection::default(),
+        stamp: None,
     }
 }
 
+/// Bumped by every fresh document load. A background refresh carries the
+/// generation it started under and is discarded once another load began, so
+/// a stale result (A→B→A, leaving edit mode) can never be applied and a stuck
+/// refresh of an old document never blocks refreshes of the new one.
+static LOAD_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn load_generation() -> u64 {
+    LOAD_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn start_preview_load(request: Request) -> (Request, std::sync::mpsc::Receiver<Doc>) {
+    LOAD_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let worker_request = request.clone();
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -718,12 +844,310 @@ fn start_preview_load(request: Request) -> (Request, std::sync::mpsc::Receiver<D
     (request, receiver)
 }
 
+type FileStamp = (std::time::SystemTime, u64);
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+/// Whether a file preview must reload: its current stamp differs from the one
+/// taken when the displayed content was read. Runs on the refresh worker —
+/// a `stat` on a stalled network or cloud drive can block indefinitely.
+fn file_refresh_needed(path: &Path, baseline: Option<FileStamp>) -> bool {
+    file_stamp(path) != baseline
+}
+
+/// Refresh workers still running. A stall on a dead network drive can block
+/// a worker forever and dropping its receiver cannot cancel it, so new
+/// refreshes pause while this many are outstanding instead of piling up.
+static REFRESH_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const MAX_REFRESH_IN_FLIGHT: usize = 2;
+/// A refresh still unanswered after this long is abandoned so the document
+/// can retry (bounded by [`MAX_REFRESH_IN_FLIGHT`]).
+const REFRESH_ABANDON_AFTER: Duration = Duration::from_secs(30);
+
+struct InFlight;
+
+impl InFlight {
+    fn claim() -> Option<Self> {
+        // Claim, then back out if over the cap: `fetch_update` is deprecated
+        // on current stable and its `try_update` rename is newer than our MSRV.
+        let order = std::sync::atomic::Ordering::SeqCst;
+        if REFRESH_IN_FLIGHT.fetch_add(1, order) < MAX_REFRESH_IN_FLIGHT {
+            Some(Self)
+        } else {
+            REFRESH_IN_FLIGHT.fetch_sub(1, order);
+            None
+        }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        REFRESH_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Whether a finished refresh still describes what is on screen.
+fn refresh_is_current(
+    started: u64,
+    request: &Request,
+    generation: u64,
+    current: Option<&Request>,
+) -> bool {
+    started == generation && current == Some(request)
+}
+
+/// herdr's own `[ui] copy_on_select` (default on), as herdr's LIVE loader
+/// sees it: a missing file means defaults, but an unreadable or half-edited
+/// file keeps the last good value instead of silently re-enabling copying.
+/// Mouse capture means herdr cannot copy a preview selection itself, so the
+/// viewer mirrors the host's behavior — and its opt-out.
+fn herdr_copy_on_select(last_good: &mut Option<bool>) -> bool {
+    let read = herdr_config_path().map(std::fs::read_to_string);
+    copy_on_select_now(read, last_good)
+}
+
+fn copy_on_select_now(read: Option<std::io::Result<String>>, last_good: &mut Option<bool>) -> bool {
+    let value = match read {
+        None => Some(true),
+        Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Some(true),
+        Some(Err(_)) => None,
+        Some(Ok(config)) => copy_on_select_parsed(&config),
+    };
+    match value {
+        Some(value) => {
+            *last_good = Some(value);
+            value
+        }
+        None => last_good.unwrap_or(true),
+    }
+}
+
+/// Where herdr 0.9 reads its config (`src/config/io.rs`): `HERDR_CONFIG_PATH`,
+/// then `$XDG_CONFIG_HOME/herdr` (honored on Windows too), then on Windows
+/// `%APPDATA%\herdr`, `%USERPROFILE%\AppData\Roaming\herdr` or
+/// `$HOME/.config/herdr`, elsewhere `~/.config/herdr`.
+fn herdr_config_path() -> Option<PathBuf> {
+    let set = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
+    if let Some(path) = set("HERDR_CONFIG_PATH") {
+        return Some(PathBuf::from(path));
+    }
+    let dir = if let Some(dir) = set("XDG_CONFIG_HOME") {
+        PathBuf::from(dir).join("herdr")
+    } else if cfg!(windows) {
+        if let Some(dir) = set("APPDATA") {
+            PathBuf::from(dir).join("herdr")
+        } else if let Some(profile) = set("USERPROFILE") {
+            PathBuf::from(profile)
+                .join("AppData")
+                .join("Roaming")
+                .join("herdr")
+        } else {
+            PathBuf::from(set("HOME")?).join(".config").join("herdr")
+        }
+    } else {
+        PathBuf::from(set("HOME")?).join(".config").join("herdr")
+    };
+    Some(dir.join("config.toml"))
+}
+
+/// `[ui] copy_on_select` parsed the way herdr does: BOMs stripped, then real
+/// TOML (`[ ui ]`, `["ui"]`, dotted keys and inline tables all count). `None`
+/// when the file is not valid TOML.
+fn copy_on_select_parsed(config: &str) -> Option<bool> {
+    let table = config.replace('\u{feff}', "").parse::<toml::Table>().ok()?;
+    // A present but wrongly-typed value is a schema error: herdr's loader
+    // rejects it and keeps its current config, so it must not read as "on".
+    match table.get("ui") {
+        None => Some(true),
+        Some(toml::Value::Table(ui)) => match ui.get("copy_on_select") {
+            None => Some(true),
+            Some(value) => value.as_bool(),
+        },
+        Some(_) => None,
+    }
+}
+
+/// The first-load view of [`copy_on_select_parsed`]: invalid TOML means
+/// herdr starts on defaults.
+#[cfg(test)]
+fn copy_on_select_from(config: &str) -> bool {
+    copy_on_select_parsed(config).unwrap_or(true)
+}
+
+/// What the copy worker reports back to the event loop.
+#[derive(Debug, PartialEq, Eq)]
+enum ReleaseCopy {
+    /// herdr's `copy_on_select` is off: nothing was copied.
+    Disabled,
+    Copied,
+    /// OSC 52 is wanted; the event loop writes it (it owns stdout).
+    Osc52(String),
+    Failed(String),
+}
+
+/// Decide and perform one copy. Pure apart from its arguments, so the
+/// routing is testable without a clipboard.
+fn release_copy(
+    text: String,
+    enabled: bool,
+    prefer_osc52: bool,
+    native: impl FnOnce(&str) -> std::io::Result<()>,
+    fallback_osc52: bool,
+) -> ReleaseCopy {
+    if !enabled {
+        return ReleaseCopy::Disabled;
+    }
+    if prefer_osc52 {
+        return ReleaseCopy::Osc52(text);
+    }
+    match native(&text) {
+        Ok(()) => ReleaseCopy::Copied,
+        Err(_) if fallback_osc52 => ReleaseCopy::Osc52(text),
+        Err(error) => ReleaseCopy::Failed(error.to_string()),
+    }
+}
+
+/// A copy request. Automatic (mouse-release) copies honor `copy_on_select`;
+/// explicit Ctrl/Cmd+C always copies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CopyRequest {
+    text: String,
+    automatic: bool,
+}
+
+/// Queue a request in order. A newer automatic copy replaces any automatic
+/// copy still waiting — only the latest drag matters — so a stalled
+/// clipboard can never build an unbounded backlog; explicit copies are kept
+/// and stay ordered against automatic ones, so an older release can never
+/// overwrite a newer Ctrl+C.
+fn enqueue_copy(queue: &mut std::collections::VecDeque<CopyRequest>, request: CopyRequest) {
+    if request.automatic {
+        queue.retain(|queued| !queued.automatic);
+    }
+    queue.push_back(request);
+}
+
+type CopyQueue = std::sync::Arc<(
+    std::sync::Mutex<std::collections::VecDeque<CopyRequest>>,
+    std::sync::Condvar,
+)>;
+
+/// One worker for every preview copy, so copies stay in order and a hung
+/// clipboard tool (or a config on a stalled drive) can never freeze the
+/// viewer's event loop. The helper itself is time-limited in `actions`.
+struct ReleaseCopier {
+    queue: CopyQueue,
+    results: std::sync::mpsc::Receiver<ReleaseCopy>,
+    /// Released by the event loop after it wrote an OSC 52 copy, so a later
+    /// native copy cannot finish first and then be overwritten by it.
+    written: std::sync::mpsc::Sender<()>,
+}
+
+impl ReleaseCopier {
+    fn start() -> Option<Self> {
+        let queue: CopyQueue = std::sync::Arc::default();
+        let (outbox, results) = std::sync::mpsc::channel();
+        let (written, osc52_done) = std::sync::mpsc::channel::<()>();
+        let worker_queue = queue.clone();
+        std::thread::Builder::new()
+            .name("preview-copy".into())
+            .spawn(move || {
+                let mut last_good = None;
+                loop {
+                    let request = {
+                        let (lock, ready) = &*worker_queue;
+                        let Ok(mut pending) = lock.lock() else { return };
+                        loop {
+                            if let Some(request) = pending.pop_front() {
+                                break request;
+                            }
+                            let Ok(next) = ready.wait(pending) else {
+                                return;
+                            };
+                            pending = next;
+                        }
+                    };
+                    let enabled = !request.automatic || herdr_copy_on_select(&mut last_good);
+                    let result = release_copy(
+                        request.text,
+                        enabled,
+                        crate::actions::osc52_preferred(),
+                        crate::actions::copy_native,
+                        crate::actions::osc52_fallback_available(),
+                    );
+                    let wait_for_terminal = matches!(result, ReleaseCopy::Osc52(_));
+                    if outbox.send(result).is_err() {
+                        return;
+                    }
+                    if wait_for_terminal && osc52_done.recv().is_err() {
+                        return;
+                    }
+                }
+            })
+            .ok()?;
+        Some(Self {
+            queue,
+            results,
+            written,
+        })
+    }
+
+    /// Forget drags still waiting: entering edit mode starts explicit,
+    /// synchronous editor copies that a late read-only copy must not follow.
+    fn drop_waiting_automatic(&self) {
+        let (lock, _) = &*self.queue;
+        if let Ok(mut pending) = lock.lock() {
+            pending.retain(|queued| !queued.automatic);
+        }
+    }
+
+    fn submit(&self, request: CopyRequest) {
+        let (lock, ready) = &*self.queue;
+        if let Ok(mut pending) = lock.lock() {
+            enqueue_copy(&mut pending, request);
+            ready.notify_one();
+        }
+    }
+}
+
+/// The footer notice for a finished copy, writing OSC 52 here on the drawing
+/// thread when the worker asked for it.
+fn release_copy_notice(result: ReleaseCopy) -> Option<String> {
+    match result {
+        ReleaseCopy::Disabled => None,
+        ReleaseCopy::Copied => Some("copied selection".into()),
+        ReleaseCopy::Osc52(text) => Some(match crate::actions::write_osc52_stdout(&text) {
+            Ok(_) => "sent selection to terminal clipboard".into(),
+            Err(error) => format!("clipboard unavailable: {error}"),
+        }),
+        ReleaseCopy::Failed(error) => Some(format!("clipboard unavailable: {error}")),
+    }
+}
+
+fn copy_selection(doc: &Doc) -> String {
+    let Some(text) = doc.selected_text() else {
+        return "select text before copying".into();
+    };
+    match crate::actions::copy_to_clipboard(&text) {
+        Ok(crate::actions::ClipboardWrite::Native) => "copied selection".into(),
+        Ok(crate::actions::ClipboardWrite::Osc52Unacknowledged) => {
+            "sent selection to terminal clipboard".into()
+        }
+        Err(error) => format!("clipboard unavailable: {error}"),
+    }
+}
+
 fn apply_diff_refresh(doc: &mut Doc, mut refreshed: Doc) {
-    if doc.name == refreshed.name
+    if doc.media.is_none()
+        && doc.name == refreshed.name
         && doc.context == refreshed.context
         && doc.numbered == refreshed.numbered
         && doc.lines == refreshed.lines
     {
+        doc.stamp = refreshed.stamp;
         return;
     }
     refreshed.wrap = doc.wrap;
@@ -773,9 +1197,10 @@ fn apply_pending(
     preview_load: &mut Option<(Request, std::sync::mpsc::Receiver<Doc>)>,
     identity_pending: &mut bool,
     control: &Path,
+    notice: &mut Option<String>,
 ) -> bool {
     match pending {
-        Pending::Close => close_own_pane(control),
+        Pending::Close => close_own_pane(control, current, notice),
         Pending::LeaveEdit => {
             if let Some(request) = current.clone() {
                 *mode = ViewMode::Preview(loading_doc(&request));
@@ -786,7 +1211,7 @@ fn apply_pending(
         }
         Pending::Switch(request) => {
             if request == Request::Close {
-                close_own_pane(control)
+                close_own_pane(control, current, notice)
             } else {
                 *mode = ViewMode::Preview(loading_doc(&request));
                 *current = Some(request.clone());
@@ -807,6 +1232,7 @@ fn restore_current_control(control: &Path, current: &Option<Request>) {
 /// `git show` with stat + patch, colored — what a click on a commit, stash,
 /// tag, or branch line renders. Immutable content: no refresh loop needed.
 fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
+    let display_spec = spec.strip_prefix("refs/tags/").unwrap_or(spec);
     let mut args: Vec<String> = vec![
         "-c".into(),
         "color.ui=always".into(),
@@ -815,6 +1241,7 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
         "--stat".into(),
         "--patch".into(),
         "--no-ext-diff".into(),
+        "--end-of-options".into(),
         spec.to_string(),
     ];
     if let Some(p) = path {
@@ -842,17 +1269,19 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
         }
     };
     Doc {
-        name: spec.to_string(),
-        context: format!("git show {spec} — {}", root.display()),
+        name: display_spec.to_string(),
+        context: format!("git show {display_spec} — {}", root.display()),
         lines,
         numbered: false,
         media: None,
         scroll: 0,
         wrap: true,
+        glow_width: None,
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
         selection: PreviewSelection::default(),
+        stamp: None,
     }
 }
 
@@ -862,12 +1291,13 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
 /// Receives the already-read `text` buffer so the MAX_BYTES guard in
 /// `load_file` is honoured — glow would otherwise re-read the full file.
 /// Pipes via stdin (`-`) to avoid treating filenames starting with `-` as
-/// flags. Width is a best-effort approximation; the ideal fix would pass
-/// `body.width` from `draw_doc` once that is available at load time.
+/// flags. The first render uses the most recently drawn body width; the event
+/// loop schedules one background reload if the actual body width differs.
 fn glow_markdown(text: &str, width: u16) -> Option<Vec<Line<'static>>> {
     use std::io::Write as _;
+    let args = glow_args(width, crate::ui::is_light());
     let mut child = std::process::Command::new("glow")
-        .args(["--style", "dark", "--width", &width.to_string(), "-"])
+        .args(args)
         .env("CLICOLOR_FORCE", "1")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -892,6 +1322,30 @@ fn glow_markdown(text: &str, width: u16) -> Option<Vec<Line<'static>>> {
         return None;
     }
     Some(lines)
+}
+
+fn glow_args(width: u16, light: bool) -> Vec<String> {
+    vec![
+        "--style".into(),
+        if light { "light" } else { "dark" }.into(),
+        "--width".into(),
+        width.to_string(),
+        "-".into(),
+    ]
+}
+
+fn choose_text_render<F>(
+    glow_rendered: Option<Vec<Line<'static>>>,
+    fallback: F,
+    glow_width: u16,
+) -> (Vec<Line<'static>>, bool, Option<u16>)
+where
+    F: FnOnce() -> Vec<Line<'static>>,
+{
+    match glow_rendered {
+        Some(rendered) => (rendered, false, Some(glow_width)),
+        None => (fallback(), true, None),
+    }
 }
 
 const MAX_MEDIA_FILE_BYTES: u64 = 32 * 1024 * 1024;
@@ -1140,10 +1594,12 @@ fn load_media_file(target: &Path, name: String, video_poster: bool) -> Doc {
         media,
         scroll: 0,
         wrap: false,
+        glow_width: None,
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
         selection: PreviewSelection::default(),
+        stamp: None,
     }
 }
 
@@ -1160,31 +1616,26 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
         return load_media_file(target, name, true);
     }
     let is_markdown = lower.ends_with(".md") || lower.ends_with(".markdown");
-    let (lines, numbered) = match std::fs::read(target) {
-        Err(e) => (vec![Line::raw(format!("(unreadable: {e})"))], true),
+    let (lines, numbered, glow_width) = match std::fs::read(target) {
+        Err(e) => (vec![Line::raw(format!("(unreadable: {e})"))], true, None),
         Ok(bytes) => {
             if bytes.contains(&0) {
                 (
                     vec![Line::raw(format!("(binary file — {} bytes)", bytes.len()))],
                     false,
+                    None,
                 )
             } else {
                 let truncated = bytes.len() > MAX_BYTES;
                 let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_BYTES)]);
                 // Markdown: render via glow; fall back to syntax highlight on failure.
-                // Width is approximated by subtracting 6 for the sidebar share and
-                // line-number gutter; ideal fix is to pass body.width from draw_doc.
-                let glow_width = crossterm::terminal::size()
-                    .map(|(w, _)| w.saturating_sub(6))
-                    .unwrap_or(74);
+                let requested_glow_width = LAST_BODY_WIDTH
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .max(20);
                 let glow_rendered = (is_markdown && target_line.is_none())
-                    .then(|| glow_markdown(&text, glow_width))
+                    .then(|| glow_markdown(&text, requested_glow_width))
                     .flatten();
-                // Glow-rendered markdown gets no line numbers (it formats its own layout).
-                let numbered = glow_rendered.is_none();
-                let mut lines: Vec<Line<'static>> = if let Some(rendered) = glow_rendered {
-                    rendered
-                } else {
+                let fallback = || {
                     crate::syntax::highlight(&name, &text, MAX_LINES).unwrap_or_else(|| {
                         text.lines()
                             .take(MAX_LINES)
@@ -1192,13 +1643,15 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
                             .collect()
                     })
                 };
+                let (mut lines, numbered, glow_width) =
+                    choose_text_render(glow_rendered, fallback, requested_glow_width);
                 if truncated || text.lines().count() > MAX_LINES {
                     lines.push(Line::raw("… (truncated)"));
                 }
                 if lines.is_empty() {
                     lines.push(Line::raw("(empty file)"));
                 }
-                (lines, numbered)
+                (lines, numbered, glow_width)
             }
         }
     };
@@ -1209,12 +1662,20 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
         numbered,
         media: None,
         scroll: 0,
-        wrap: true,
+        // Glow already laid out tables and paragraphs for `glow_width`.
+        wrap: glow_width.is_none(),
+        glow_width,
         rows: Vec::new(),
         rows_key: None,
         pending_src: target_line.map(|line| line.saturating_sub(1)),
         selection: PreviewSelection::default(),
+        stamp: None,
     }
+}
+
+fn glow_needs_reload(doc: &Doc, body_width: u16) -> bool {
+    let body_width = body_width.max(20);
+    doc.glow_width.is_some_and(|width| width != body_width)
 }
 
 fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
@@ -1273,14 +1734,31 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
         media: None,
         scroll: 0,
         wrap: true,
+        glow_width: None,
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
         selection: PreviewSelection::default(),
+        stamp: None,
     }
 }
 
 fn read_control(control: &Path) -> Option<Request> {
+    if !control_path_ok(control) {
+        return None;
+    }
+    read_control_file(control)
+}
+
+#[cfg(all(test, unix))]
+fn read_control_in(control: &Path, expected_dir: &Path) -> Option<Request> {
+    if !control_path_ok_in(control, expected_dir) {
+        return None;
+    }
+    read_control_file(control)
+}
+
+fn read_control_file(control: &Path) -> Option<Request> {
     let mut buf = String::new();
     std::fs::File::open(control)
         .ok()?
@@ -1362,10 +1840,19 @@ fn editor_pane_label(doc_name: &str) -> String {
     format!("{doc_name} · editor")
 }
 
+/// What the control file must hold after a close that did not happen: the
+/// document still on screen (or nothing), never the `close` request itself.
+fn control_after_failed_close(current: &Option<Request>) -> String {
+    current.as_ref().map(request_payload).unwrap_or_default()
+}
+
+/// Set once a takeover restore failed while this viewer tried to close.
+static RESTORE_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Close the whole preview tab. Closing only the viewer pane leaves its
 /// auto-docked sidebar behind as a convincing but unusable preview husk.
 /// An inline viewer owns nothing but its own pane, so it closes just that.
-fn close_own_pane(control: &Path) -> bool {
+fn close_own_pane(control: &Path, current: &Option<Request>, notice: &mut Option<String>) -> bool {
     let Ok(pane_id) = std::env::var("HERDR_PANE_ID") else {
         return false;
     };
@@ -1373,13 +1860,38 @@ fn close_own_pane(control: &Path) -> bool {
         return false;
     }
     if runs_inline() {
+        let list = ipc::call_text("pane.list", serde_json::json!({})).unwrap_or_default();
+        let preview = previews_in(&list)
+            .into_iter()
+            .find(|preview| preview.pane_id == pane_id);
+        let tab = preview
+            .as_ref()
+            .map(|preview| preview.origin_tab_id.as_str())
+            .unwrap_or("");
+        if !tab.is_empty()
+            && let Err(error) = crate::takeover::restore(tab, &pane_id)
+        {
+            // Never trap the viewer: a second close gives up on the layout
+            // and leaves the working panes in their (relabelled) tab.
+            if !RESTORE_FAILED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                // A `close` request that asked for this must not stay in the
+                // control file: the loop would re-read it and silently take
+                // the failure's "close anyway" branch on the next iteration.
+                let _ = write_scratch_file(control, &control_after_failed_close(current));
+                *notice = Some(format!(
+                    "Cannot restore: {error}. Press q again to close anyway; your panes stay in the temporary tab."
+                ));
+                return false;
+            }
+            let _ = crate::takeover::abandon_tab(tab);
+        }
         let closed = pane_close_succeeded(ipc::call_text(
             "pane.close",
             serde_json::json!({ "pane_id": pane_id }),
         ));
         if closed {
-            let _ = std::fs::remove_file(control);
-            let _ = std::fs::remove_file(control_path_for_pane(&pane_id));
+            remove_control_file(control);
+            remove_control_file(&control_path_for_pane(&pane_id));
         }
         return closed;
     }
@@ -1389,8 +1901,8 @@ fn close_own_pane(control: &Path) -> bool {
             .into_iter()
             .find(|preview| preview.pane_id == pane_id)
     });
-    let _ = std::fs::remove_file(control);
-    let _ = std::fs::remove_file(control_path_for_pane(&pane_id));
+    remove_control_file(control);
+    remove_control_file(&control_path_for_pane(&pane_id));
     if let Some(preview) = preview.filter(|preview| {
         preview.dedicated
             && list
@@ -1482,17 +1994,32 @@ fn pin_own_tab(doc_key: &str) {
 /// cleanup. Cheap: one readdir against a `pane.list` we already have.
 fn sweep_orphan_controls(pane_list_json: &str) {
     let previews = previews_in(pane_list_json);
+    sweep_orphan_controls_in(&scratch_dir(), &previews);
+    sweep_orphan_controls_in(&legacy_scratch_dir(), &previews);
+}
+
+fn sweep_orphan_controls_in(dir: &Path, previews: &[PreviewPane]) {
+    // Skip entirely rather than reading through a directory we have not
+    // verified as private — an unswept orphan is harmless; touching files in
+    // a directory another local user could have planted is not.
+    if !crate::rundir::is_private(dir) {
+        return;
+    }
+    // A present viewer keeps its control file even while its heartbeat is
+    // stale (a suspended machine, a stalled loop): deleting it would leave a
+    // live, possibly dirty, editor unable to receive its close request. Only
+    // label-only panes from a server resume are known dead.
     let live: std::collections::BTreeSet<String> = previews
         .iter()
-        .filter(|preview| !preview.stale)
+        .filter(|preview| !preview.resumed)
         .map(|preview| preview.pane_id.replace(':', "_"))
         .collect();
     let live_controls: std::collections::BTreeSet<PathBuf> = previews
-        .into_iter()
-        .filter(|preview| !preview.stale)
-        .map(|preview| preview.control)
+        .iter()
+        .filter(|preview| !preview.resumed)
+        .map(|preview| preview.control.clone())
         .collect();
-    let Ok(entries) = std::fs::read_dir(scratch_dir()) else {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
@@ -1519,8 +2046,30 @@ fn sweep_orphan_controls(pane_list_json: &str) {
     }
 }
 
+/// Re-stamp every 5s of wall-clock time, and immediately after the clock
+/// jumps backwards (a correction must not silence the heartbeat).
+fn heartbeat_due(last: u64, now: u64) -> bool {
+    now < last || now - last >= 5
+}
+
 /// The viewer's event loop; returns when the user closes it.
 pub fn run(control: &Path) -> std::io::Result<()> {
+    // A control path outside our confined scratch directory would otherwise
+    // leave this process idling forever, silently never seeing a request —
+    // fail fast instead. This can legitimately happen if the launcher and
+    // this process disagree on `rundir::dir`'s no-`HOME` fallback (`TMPDIR`
+    // can vary by process), so say that rather than just "denied".
+    if !control_path_ok(control) {
+        let mut err = control_path_err(control).to_string();
+        err.push_str(
+            " (the launcher and this process may have resolved a different \
+             runtime directory — see rundir::dir's fallback)",
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            err,
+        ));
+    }
     let theme = IconTheme::resolve(
         std::env::var("HERDR_SIDEBAR_ICONS")
             .or_else(|_| std::env::var("HERDR_AA_FILETREE_ICONS"))
@@ -1538,10 +2087,12 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         media: None,
         scroll: 0,
         wrap: true,
+        glow_width: None,
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
         selection: PreviewSelection::default(),
+        stamp: None,
     });
     let mut mode = ViewMode::Preview(doc);
     report_identity(
@@ -1566,10 +2117,16 @@ pub fn run(control: &Path) -> std::io::Result<()> {
     let mut edit_body = Rect::default();
     let mut prompt: Option<Prompt> = None;
     let mut notice: Option<String> = None;
-    let mut last_heartbeat = Instant::now();
+    let mut last_heartbeat = crate::state::unix_now();
     let mut last_external_check = Instant::now();
     let mut last_diff_refresh = Instant::now();
-    let mut diff_refresh: Option<(Request, std::sync::mpsc::Receiver<Doc>)> = None;
+    let mut diff_refresh: Option<(
+        u64,
+        Request,
+        std::sync::mpsc::Receiver<Option<Doc>>,
+        Instant,
+    )> = None;
+    let mut copier: Option<ReleaseCopier> = None;
     let mut identity_pending = false;
     let result = loop {
         let loaded =
@@ -1585,8 +2142,11 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         if let Some((request, loaded)) = loaded {
             preview_load = None;
             if current.as_ref() == Some(&request)
-                && let (ViewMode::Preview(doc), Some(loaded)) = (&mut mode, loaded)
+                && let (ViewMode::Preview(doc), Some(mut loaded)) = (&mut mode, loaded)
             {
+                if doc.glow_width.is_some() && loaded.glow_width.is_some() {
+                    loaded.scroll = doc.scroll;
+                }
                 *doc = loaded;
             }
         }
@@ -1616,6 +2176,15 @@ pub fn run(control: &Path) -> std::io::Result<()> {
             );
             identity_pending = false;
         }
+        let body_width = preview_body.width.max(20);
+        if preview_load.is_none()
+            && let (ViewMode::Preview(doc), Some(request @ Request::File { line: None, .. })) =
+                (&mode, current.as_ref())
+            && glow_needs_reload(doc, body_width)
+        {
+            LAST_BODY_WIDTH.store(body_width, std::sync::atomic::Ordering::Relaxed);
+            preview_load = Some(start_preview_load(request.clone()));
+        }
         let mut should_close = false;
         let poll = if preview_load.is_some() {
             LOAD_POLL
@@ -1638,6 +2207,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                                 &mut preview_load,
                                                 &mut identity_pending,
                                                 control,
+                                                &mut notice,
                                             );
                                         }
                                         Ok(SaveOutcome::Conflict) => {
@@ -1658,6 +2228,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                     &mut preview_load,
                                     &mut identity_pending,
                                     control,
+                                    &mut notice,
                                 );
                             }
                             (Prompt::Unsaved(_), KeyCode::Esc | KeyCode::Char('c')) => {
@@ -1680,6 +2251,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                                     &mut preview_load,
                                                     &mut identity_pending,
                                                     control,
+                                                    &mut notice,
                                                 );
                                             }
                                         }
@@ -1703,6 +2275,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                                     &mut preview_load,
                                                     &mut identity_pending,
                                                     control,
+                                                    &mut notice,
                                                 );
                                             }
                                         }
@@ -1733,22 +2306,34 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                 match key.code {
                                     KeyCode::Char('a') if shortcut => doc.select_all(),
                                     KeyCode::Char('c') if shortcut => {
-                                        notice = Some(match doc.selected_text() {
+                                        // Same ordered queue as release copies, so an older
+                                        // automatic copy cannot land after this one.
+                                        match doc.selected_text() {
+                                            None => {
+                                                notice = Some("select text before copying".into())
+                                            }
                                             Some(text) => {
-                                                match crate::actions::copy_to_clipboard(&text) {
-                                                    Ok(()) => "copied selection".into(),
-                                                    Err(error) => {
-                                                        format!("clipboard unavailable: {error}")
-                                                    }
+                                                if copier.is_none() {
+                                                    copier = ReleaseCopier::start();
+                                                }
+                                                match &copier {
+                                                    Some(copier) => copier.submit(CopyRequest {
+                                                        text,
+                                                        automatic: false,
+                                                    }),
+                                                    None => notice = Some(copy_selection(doc)),
                                                 }
                                             }
-                                            None => "select text before copying".into(),
-                                        });
+                                        }
                                     }
                                     KeyCode::Esc | KeyCode::Char('q') => {
-                                        should_close = close_own_pane(control);
+                                        should_close =
+                                            close_own_pane(control, &current, &mut notice);
                                     }
                                     KeyCode::Char('e') => {
+                                        if let Some(copier) = &copier {
+                                            copier.drop_waiting_automatic();
+                                        }
                                         if doc.media.is_some() {
                                             notice = Some("media previews are read-only".into());
                                         } else if let Some(Request::File { path, .. }) =
@@ -1782,8 +2367,14 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                     KeyCode::Down | KeyCode::Char('j') => {
                                         doc.scroll = (doc.scroll + 1).min(max)
                                     }
-                                    KeyCode::PageUp => doc.scroll = doc.scroll.saturating_sub(page),
-                                    KeyCode::PageDown => doc.scroll = (doc.scroll + page).min(max),
+                                    // Shift+Space is byte-identical to Space without the
+                                    // kitty keyboard protocol, so page-back takes `b`.
+                                    KeyCode::PageUp | KeyCode::Char('b') => {
+                                        doc.scroll = doc.scroll.saturating_sub(page)
+                                    }
+                                    KeyCode::PageDown | KeyCode::Char(' ') => {
+                                        doc.scroll = (doc.scroll + page).min(max)
+                                    }
                                     KeyCode::Home | KeyCode::Char('g') => doc.scroll = 0,
                                     KeyCode::End | KeyCode::Char('G') => doc.scroll = max,
                                     KeyCode::Char('w') if doc.media.is_none() => {
@@ -1815,6 +2406,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                                 &mut preview_load,
                                                 &mut identity_pending,
                                                 control,
+                                                &mut notice,
                                             );
                                         }
                                     }
@@ -1822,7 +2414,8 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                         if editor.dirty {
                                             prompt = Some(Prompt::Unsaved(Pending::Close));
                                         } else {
-                                            should_close = close_own_pane(control);
+                                            should_close =
+                                                close_own_pane(control, &current, &mut notice);
                                         }
                                     }
                                     EditAction::Save => match editor.save(false) {
@@ -1846,9 +2439,28 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                             MouseEventKind::Down(MouseButton::Left)
                                 if mouse.row == 0 && mouse.column < 3 =>
                             {
-                                should_close = close_own_pane(control);
+                                should_close = close_own_pane(control, &current, &mut notice);
                             }
-                            _ => doc.on_mouse(&mouse, preview_body),
+                            _ => {
+                                // Copy on release, like herdr's own panes — unless the
+                                // user turned that off in herdr (`[ui] copy_on_select`).
+                                // Off the event loop: a hung clipboard tool must not
+                                // freeze the preview.
+                                if doc.on_mouse(&mouse, preview_body)
+                                    && let Some(text) = doc.selected_text()
+                                {
+                                    if copier.is_none() {
+                                        copier = ReleaseCopier::start();
+                                    }
+                                    match &copier {
+                                        Some(copier) => copier.submit(CopyRequest {
+                                            text,
+                                            automatic: true,
+                                        }),
+                                        None => notice = Some(copy_selection(doc)),
+                                    }
+                                }
+                            }
                         }
                     }
                     ViewMode::Edit(editor) => match mouse.kind {
@@ -1864,7 +2476,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                             if editor.dirty {
                                 prompt = Some(Prompt::Unsaved(Pending::Close));
                             } else {
-                                should_close = close_own_pane(control);
+                                should_close = close_own_pane(control, &current, &mut notice);
                             }
                         }
                         _ if prompt.is_none() => editor.on_mouse(&mouse, edit_body),
@@ -1880,7 +2492,10 @@ pub fn run(control: &Path) -> std::io::Result<()> {
 
         // These checks run after every iteration, including sustained input;
         // otherwise a held key can starve the liveness heartbeat indefinitely.
-        if last_heartbeat.elapsed() >= Duration::from_secs(5) {
+        // Wall-clock, not `Instant`: a monotonic clock stops during suspend, so
+        // after a resume the viewer would wait out the rest of its interval
+        // while recovery code already reads the old stamp as stale.
+        if heartbeat_due(last_heartbeat, crate::state::unix_now()) {
             report_identity(
                 &mode,
                 current.as_ref().map(Request::doc_key).as_deref(),
@@ -1891,7 +2506,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
             // tints and selection follow immediately — an already-highlighted
             // file keeps its syntax colors until it is reloaded.
             crate::ui::set_color_theme(crate::state::load_state().color_theme);
-            last_heartbeat = Instant::now();
+            last_heartbeat = crate::state::unix_now();
         }
         if prompt.is_none() {
             let target = read_control(control);
@@ -1903,7 +2518,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                 {
                     prompt = Some(Prompt::Unsaved(Pending::Switch(request)));
                 } else if request == Request::Close {
-                    if close_own_pane(control) {
+                    if close_own_pane(control, &current, &mut notice) {
                         break Ok(());
                     }
                 } else {
@@ -1921,19 +2536,38 @@ pub fn run(control: &Path) -> std::io::Result<()> {
             }
             last_external_check = Instant::now();
         }
-        let refreshed =
-            diff_refresh
-                .as_ref()
-                .and_then(|(request, receiver)| match receiver.try_recv() {
-                    Ok(doc) => Some((request.clone(), Some(doc))),
+        if let Some(copier) = &copier {
+            while let Ok(result) = copier.results.try_recv() {
+                let osc52 = matches!(result, ReleaseCopy::Osc52(_));
+                if let Some(text) = release_copy_notice(result) {
+                    notice = Some(text);
+                }
+                if osc52 {
+                    let _ = copier.written.send(());
+                }
+            }
+        }
+        // A refresh started for an earlier document is abandoned, not awaited:
+        // its worker may be stuck on a stalled drive.
+        if diff_refresh.as_ref().is_some_and(|(started, _, _, at)| {
+            *started != load_generation() || at.elapsed() >= REFRESH_ABANDON_AFTER
+        }) {
+            diff_refresh = None;
+        }
+        let refreshed = diff_refresh
+            .as_ref()
+            .and_then(
+                |(started, request, receiver, _)| match receiver.try_recv() {
+                    Ok(doc) => Some((*started, request.clone(), doc)),
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        Some((request.clone(), None))
+                        Some((*started, request.clone(), None))
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => None,
-                });
-        if let Some((request, refreshed)) = refreshed {
+                },
+            );
+        if let Some((started, request, refreshed)) = refreshed {
             diff_refresh = None;
-            if current.as_ref() == Some(&request)
+            if refresh_is_current(started, &request, load_generation(), current.as_ref())
                 && let (ViewMode::Preview(doc), Some(refreshed)) = (&mut mode, refreshed)
             {
                 apply_diff_refresh(doc, refreshed);
@@ -1942,15 +2576,25 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         if last_diff_refresh.elapsed() >= Duration::from_secs(2) {
             if preview_load.is_none()
                 && diff_refresh.is_none()
-                && matches!(mode, ViewMode::Preview(_))
-                && let Some(request @ Request::Diff { .. }) = current.clone()
+                && let ViewMode::Preview(doc) = &mode
+                && let Some(request @ (Request::Diff { .. } | Request::File { .. })) =
+                    current.clone()
+                && let Some(in_flight) = InFlight::claim()
             {
+                let baseline = doc.stamp;
                 let worker_request = request.clone();
                 let (sender, receiver) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
-                    let _ = sender.send(load(&worker_request));
+                    let _in_flight = in_flight;
+                    // Files stat first, here on the worker; only a changed
+                    // stamp pays for a reload. Diffs always re-run.
+                    let reload = match &worker_request {
+                        Request::File { path, .. } => file_refresh_needed(path, baseline),
+                        _ => true,
+                    };
+                    let _ = sender.send(reload.then(|| load(&worker_request)));
                 });
-                diff_refresh = Some((request, receiver));
+                diff_refresh = Some((load_generation(), request, receiver, Instant::now()));
             }
             last_diff_refresh = Instant::now();
         }
@@ -1979,6 +2623,7 @@ fn draw_doc(
 
     // Lay the body out for THIS width first: everything below (the clamp,
     // the slice, the page stride) counts rendered rows.
+    LAST_BODY_WIDTH.store(body.width, std::sync::atomic::Ordering::Relaxed);
     doc.relayout(body.width, body.height);
     doc.scroll = doc.scroll.min(
         doc.rows
@@ -2043,12 +2688,31 @@ fn draw_doc(
             " image preview  q close".into()
         }
     } else if editable {
-        format!(" drag select  Ctrl/Cmd+C copy  e edit  {wrap_hint}  q close")
+        preview_hint(&["e edit", "space/b page", wrap_hint], footer.width)
     } else {
-        format!(" drag select  Ctrl/Cmd+C copy  ↑↓ scroll  {wrap_hint}  q close")
+        preview_hint(&["space/b page", "↑↓ scroll", wrap_hint], footer.width)
     };
     frame.render_widget(Paragraph::new(Line::from(hint).dim()), footer);
     (usize::from(body.height).saturating_sub(1).max(1), body)
+}
+
+/// The read-only footer: `q close` first so a narrow inline or takeover pane
+/// never clips the way out, then as many optional hints as fit, then the
+/// selection/copy hint when there is room for everything.
+fn preview_hint(optional: &[&str], width: u16) -> String {
+    let width = usize::from(width);
+    let mut hint = String::from(" q close");
+    for part in optional
+        .iter()
+        .copied()
+        .chain(["drag select  Ctrl/Cmd+C copy"])
+    {
+        if hint.chars().count() + 2 + part.chars().count() <= width {
+            hint.push_str("  ");
+            hint.push_str(part);
+        }
+    }
+    hint
 }
 
 fn draw_editor(
@@ -2116,6 +2780,64 @@ fn draw_editor(
 // Client side: how the sidebar views open things in the viewer pane.
 // ---------------------------------------------------------------------------
 
+/// What a file click may do to a stale preview in its space.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StaleCleanup {
+    CloseTab { tab_id: String, control: PathBuf },
+    ClosePane { pane_id: String, control: PathBuf },
+}
+
+/// Only label-only panes left by a server resume are provably dead — their
+/// process metadata is gone, so nothing unsaved can live there. A pane that
+/// still carries a (stale) heartbeat may be a suspended or stalled viewer
+/// holding an unsaved editor buffer, including a temporary takeover viewer;
+/// a click never kills it. It is simply not routed to, and its own close
+/// (q / Esc / ✕) still works once it responds.
+pub(crate) fn stale_cleanup(previews: &[PreviewPane], pane_list_json: &str) -> Vec<StaleCleanup> {
+    previews
+        .iter()
+        .filter(|preview| preview.stale && preview.resumed)
+        .map(|preview| {
+            if tab_is_plugin_only(pane_list_json, &preview.tab_id) {
+                StaleCleanup::CloseTab {
+                    tab_id: preview.tab_id.clone(),
+                    control: preview.control.clone(),
+                }
+            } else {
+                StaleCleanup::ClosePane {
+                    pane_id: preview.pane_id.clone(),
+                    control: preview.control.clone(),
+                }
+            }
+        })
+        .collect()
+}
+
+/// Can a click route its document into `preview`? Stale viewers are never
+/// routed to (and never killed, see [`stale_cleanup`]); an inline viewer
+/// belongs to ONE tab, and a tab-mode click never adopts one. Pure and
+/// non-blocking: a stale viewer anywhere else in the workspace costs a click
+/// nothing.
+pub(crate) fn routable(preview: &PreviewPane, inline: bool, caller_tab: &str) -> bool {
+    !preview.stale && preview.inline == inline && (!inline || preview.tab_id == caller_tab)
+}
+
+/// Inline placement only: a present-but-unresponsive viewer already in the
+/// caller's own tab. Spawning another beside it would split the tab again on
+/// every click, so the click hands it the request and reports instead.
+pub(crate) fn unresponsive_inline_in<'a>(
+    previews: &'a [PreviewPane],
+    inline: bool,
+    caller_tab: &str,
+) -> Option<&'a PreviewPane> {
+    if !inline {
+        return None;
+    }
+    previews.iter().find(|preview| {
+        preview.inline && preview.tab_id == caller_tab && preview.stale && !preview.resumed
+    })
+}
+
 /// Open `payload` (identified by `doc_key`) where the `Preview placement`
 /// setting says.
 ///
@@ -2139,32 +2861,46 @@ pub fn open_in_pane(
     let list = ipc::call_text("pane.list", serde_json::json!({}))
         .map_err(|e| format!("preview failed: {e}"))?;
     let caller_tab_id = crate::launch::tab_of(&list, my_pane_id);
-    sweep_orphan_controls(&list);
+    // An unrestorable journal must never block ordinary previews in this
+    // tab. The takeover path below retries the restore and reports it.
+    if let Err(error) = crate::takeover::recover(&caller_tab_id) {
+        eprintln!("herdr-sidebar: temporary preview restore deferred: {error}");
+    }
+    let list =
+        ipc::call_text("pane.list", serde_json::json!({})).map_err(|error| error.to_string())?;
     // Route only within OUR space. A session-wide search reused another
     // project's ephemeral tab and focus jumped there, which reads as the
     // tree refusing to change.
     let my_workspace = crate::launch::workspace_of(&list, my_pane_id);
+    sweep_orphan_controls(&list);
     let mut previews: Vec<PreviewPane> = previews_in(&list)
         .into_iter()
         .filter(|p| p.workspace_id == my_workspace)
         .collect();
-    for stale in previews.iter().filter(|preview| preview.stale) {
-        let _ = std::fs::remove_file(&stale.control);
-        if (stale.dedicated || stale.resumed) && tab_is_plugin_only(&list, &stale.tab_id) {
-            let _ = ipc::call_text("tab.close", serde_json::json!({ "tab_id": stale.tab_id }));
-        } else {
-            let _ = ipc::call_text(
-                "pane.close",
-                serde_json::json!({ "pane_id": stale.pane_id }),
-            );
+    for action in stale_cleanup(&previews, &list) {
+        match action {
+            StaleCleanup::CloseTab { tab_id, control } => {
+                remove_control_file(&control);
+                let _ = ipc::call_text("tab.close", serde_json::json!({ "tab_id": tab_id }));
+            }
+            StaleCleanup::ClosePane { pane_id, control } => {
+                remove_control_file(&control);
+                let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": pane_id }));
+            }
         }
     }
-    previews.retain(|preview| !preview.stale);
+    if let Some(frozen) = unresponsive_inline_in(&previews, inline, &caller_tab_id) {
+        // Never wait here and never kill it: queue the document for when it
+        // responds (its own unsaved-changes prompt still guards a dirty buffer).
+        let _ = write_scratch_file(&frozen.control, payload);
+        return Err(
+            "the preview in this tab is not responding; it will show this file when it does \
+             (or close its pane from herdr)"
+                .into(),
+        );
+    }
+    previews.retain(|preview| routable(preview, inline, &caller_tab_id));
     previews.sort_by(|a, b| a.tab_id.cmp(&b.tab_id).then(a.pane_id.cmp(&b.pane_id)));
-    // An inline viewer belongs to ONE tab: never route this tab's clicks into
-    // another tab's pane, and never let a tab-mode click adopt one.
-    previews
-        .retain(|preview| preview.inline == inline && (!inline || preview.tab_id == caller_tab_id));
     let origin_tab_id = preview_origin_tab(&previews, &caller_tab_id);
 
     // 1. Already open — jump to it, pinned or not.
@@ -2198,7 +2934,17 @@ pub fn open_in_pane(
     }
 
     // 3. Nothing reusable — a pane beside the sidebar, or a tab of its own.
-    if inline {
+    if state.preview_placement == crate::state::PreviewPlacement::Replace {
+        crate::takeover::open(
+            my_pane_id,
+            spawn_cwd,
+            doc_key,
+            payload,
+            &caller_tab_id,
+            state.dock_right,
+            state.sidebar_width,
+        )
+    } else if inline {
         spawn_inline_pane(
             my_pane_id,
             spawn_cwd,
@@ -2311,7 +3057,7 @@ fn spawn_preview_tab(
 /// away from its dock edge, and leave focus in the sidebar: the preview is
 /// visible right there, so stealing focus would only stop the user from
 /// walking the tree with the arrow keys.
-fn spawn_inline_pane(
+pub(crate) fn spawn_inline_pane(
     my_pane_id: &str,
     spawn_cwd: &Path,
     doc_key: &str,
@@ -2361,32 +3107,72 @@ fn remember_origin(pane_id: &str, tab_id: &str) {
     );
 }
 
-/// Ask this tab's viewer to close (Esc from the sidebar). A live viewer owns
-/// the close so an editor with unsaved changes can confirm first; only a stale
-/// resumed pane is killed directly.
-pub fn close_in_tab(my_pane_id: &str) {
+/// How the sidebar's Esc treats this tab's viewer.
+#[derive(Debug, PartialEq, Eq)]
+enum EscClose {
+    /// Ask the viewer to close itself, so a dirty editor can confirm first.
+    Request,
+    /// A label-only pane from a server resume: provably no process left.
+    Kill,
+}
+
+/// Only a resumed husk (no heartbeat token at all) is killed. A stale stamp
+/// may be a suspended or stalled viewer with unsaved edits.
+fn esc_close_action(stale: bool, resumed: bool) -> EscClose {
+    if stale && resumed {
+        EscClose::Kill
+    } else {
+        EscClose::Request
+    }
+}
+
+/// Ask this tab's viewer to close (Esc from the sidebar). A viewer owns its
+/// close so an editor with unsaved changes can confirm first. Returns a
+/// notice for the sidebar when the viewer does not respond.
+pub fn close_in_tab(my_pane_id: &str) -> Option<String> {
     let Ok(json) = ipc::call_text("pane.list", serde_json::json!({})) else {
-        return;
+        return None;
     };
-    if let Some((id, stale)) = viewer_pane_in_tab(&json, my_pane_id) {
-        if stale {
-            if let Some(preview) = previews_in(&json)
-                .into_iter()
-                .find(|preview| preview.pane_id == id)
-                && (preview.dedicated || preview.resumed)
-                && tab_is_plugin_only(&json, &preview.tab_id)
-            {
-                close_preview_tab(&preview);
-            } else {
-                let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }));
+    let tab = crate::launch::tab_of(&json, my_pane_id);
+    let Some((id, stale)) = viewer_pane_in_tab(&json, my_pane_id) else {
+        // Nothing to close, but an orphaned takeover journal (its viewer was
+        // closed from herdr) can still bring the working panes back.
+        return crate::takeover::recover(&tab)
+            .err()
+            .map(|error| format!("cannot restore the working panes: {error}"));
+    };
+    let preview = previews_in(&json)
+        .into_iter()
+        .find(|preview| preview.pane_id == id);
+    let resumed = preview.as_ref().is_some_and(|preview| preview.resumed);
+    match esc_close_action(stale, resumed) {
+        EscClose::Kill => {
+            match preview {
+                Some(preview)
+                    if (preview.dedicated || preview.resumed)
+                        && tab_is_plugin_only(&json, &preview.tab_id) =>
+                {
+                    close_preview_tab(&preview);
+                }
+                _ => {
+                    let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }));
+                }
             }
-        } else {
-            let control = previews_in(&json)
-                .into_iter()
-                .find(|preview| preview.pane_id == id)
+            crate::takeover::recover(&tab)
+                .err()
+                .map(|error| format!("cannot restore the working panes: {error}"))
+        }
+        EscClose::Request => {
+            let control = preview
                 .map(|preview| preview.control)
                 .unwrap_or_else(|| control_path_for_pane(&id));
             let _ = write_scratch_file(&control, "close");
+            // No waiting: the request applies as soon as the viewer responds.
+            stale.then(|| {
+                "preview is not responding; it will close when it does (or close its pane \
+                 from herdr)"
+                    .to_string()
+            })
         }
     }
 }
@@ -2477,7 +3263,7 @@ pub struct PreviewPane {
 }
 
 /// Every preview pane in the session, from one `pane.list` payload.
-fn previews_in(pane_list_json: &str) -> Vec<PreviewPane> {
+pub(crate) fn previews_in(pane_list_json: &str) -> Vec<PreviewPane> {
     #[derive(serde::Deserialize)]
     struct Msg {
         result: Res,
@@ -2684,6 +3470,7 @@ fn spawn_viewer_pane(
     payload: &str,
     inline: Option<InlineSpawn>,
 ) -> Result<(String, PathBuf), String> {
+    crate::rundir::ensure_private(&scratch_dir()).map_err(|e| format!("preview failed: {e}"))?;
     let control = fresh_control_path();
     write_scratch_file(&control, payload).map_err(|e| format!("preview failed: {e}"))?;
     let layout = ipc::call_text("pane.layout", serde_json::json!({ "pane_id": my_pane_id })).ok();
@@ -2727,7 +3514,7 @@ fn spawn_viewer_pane(
         .ok()
         .and_then(|r| crate::launch::split_pane_id(&r))
         .ok_or_else(|| {
-            let _ = std::fs::remove_file(&control);
+            remove_control_file(&control);
             "preview pane failed to open".to_string()
         })?;
     if plan.swap
@@ -2758,6 +3545,7 @@ fn create_viewer_tab(
     doc_key: &str,
     payload: &str,
 ) -> Result<(String, String, PathBuf), String> {
+    crate::rundir::ensure_private(&scratch_dir()).map_err(|e| format!("preview failed: {e}"))?;
     let control = fresh_control_path();
     write_scratch_file(&control, payload).map_err(|e| format!("preview failed: {e}"))?;
     let workspace_id = ipc::call_text("pane.list", serde_json::json!({}))
@@ -2777,7 +3565,7 @@ fn create_viewer_tab(
         .as_deref()
         .and_then(crate::launch::created_tab_root_pane)
     else {
-        let _ = std::fs::remove_file(&control);
+        remove_control_file(&control);
         return Err("preview tab failed to open".into());
     };
     if let Err(error) = register_viewer_pane(&new_pane, &control, doc_key, false) {
@@ -2847,12 +3635,12 @@ fn mark_dedicated_preview(pane_id: &str) -> bool {
 }
 
 fn cleanup_spawn(pane_id: &str, control: &Path) {
-    let _ = std::fs::remove_file(control);
+    remove_control_file(control);
     let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": pane_id }));
 }
 
 fn cleanup_moved_spawn(pane_id: &str, tab_id: &str, control: &Path) {
-    let _ = std::fs::remove_file(control);
+    remove_control_file(control);
     let plugin_only = ipc::call_text("pane.list", serde_json::json!({}))
         .ok()
         .is_some_and(|list| tab_is_plugin_only(&list, tab_id));
@@ -3003,10 +3791,12 @@ mod tests {
             media: None,
             scroll: 0,
             wrap: true,
+            glow_width: None,
             rows: Vec::new(),
             rows_key: None,
             pending_src: None,
             selection: PreviewSelection::default(),
+            stamp: None,
         }
     }
 
@@ -3166,6 +3956,155 @@ mod tests {
     }
 
     #[test]
+    fn copy_on_release_follows_herdrs_copy_on_select_setting() {
+        assert!(copy_on_select_from(""), "herdr's default is on");
+        assert!(copy_on_select_from("[ui]\n# copy_on_select = false\n"));
+        assert!(!copy_on_select_from("[ui]\ncopy_on_select = false # off\n"));
+        assert!(copy_on_select_from("[ui]\ncopy_on_select = true\n"));
+        assert!(
+            copy_on_select_from("[other]\ncopy_on_select = false\n[ui]\nmouse_capture = true\n"),
+            "only the [ui] table counts"
+        );
+        // Astra #5: every TOML spelling herdr accepts.
+        assert!(!copy_on_select_from("[ ui ]\ncopy_on_select = false\n"));
+        assert!(!copy_on_select_from("[\"ui\"]\ncopy_on_select = false\n"));
+        assert!(!copy_on_select_from("ui.copy_on_select = false\n"));
+        assert!(!copy_on_select_from("ui = { copy_on_select = false }\n"));
+        assert!(!copy_on_select_from(
+            "\u{feff}[ui]\ncopy_on_select = false\n"
+        ));
+        assert!(
+            !copy_on_select_from(
+                "[keys]\nlist = [\n  \"[ui]\",\n]\n[ui]\ncopy_on_select = false\n"
+            ),
+            "array lines that look like headers are not tables"
+        );
+        assert!(
+            copy_on_select_from("[ui\ncopy_on_select = false\n"),
+            "invalid TOML: herdr defaults"
+        );
+    }
+
+    /// Astra round 2 #6: herdr's live loader keeps its current config when the
+    /// file turns unreadable or invalid mid-edit; so does the viewer. A
+    /// missing file means defaults, exactly as in herdr.
+    #[test]
+    fn a_broken_config_reload_keeps_the_last_good_setting() {
+        let mut last_good = None;
+        let off = Some(Ok("[ui]\ncopy_on_select = false\n".to_string()));
+        assert!(!copy_on_select_now(off, &mut last_good));
+        let wrong_type = Some(Ok("[ui]\ncopy_on_select = \"false\"\n".to_string()));
+        assert!(
+            !copy_on_select_now(wrong_type, &mut last_good),
+            "schema error keeps last good"
+        );
+        let half_edited = Some(Ok("[ui\ncopy_on".to_string()));
+        assert!(!copy_on_select_now(half_edited, &mut last_good));
+        let locked = Some(Err(std::io::Error::other("sharing violation")));
+        assert!(!copy_on_select_now(locked, &mut last_good));
+        let missing = Some(Err(std::io::Error::from(std::io::ErrorKind::NotFound)));
+        assert!(
+            copy_on_select_now(missing, &mut last_good),
+            "no file: defaults"
+        );
+        assert!(
+            copy_on_select_now(None, &mut None),
+            "no config location: defaults"
+        );
+        let mut fresh = None;
+        assert!(
+            copy_on_select_now(Some(Ok("[ui".to_string())), &mut fresh),
+            "an invalid file at first load: defaults"
+        );
+    }
+
+    /// Astra round 2 #2/#4: copies stay ordered across kinds, and pending
+    /// automatic copies coalesce so a stalled clipboard cannot grow a backlog.
+    #[test]
+    fn copy_queue_orders_explicit_copies_and_coalesces_automatic_ones() {
+        let auto = |text: &str| CopyRequest {
+            text: text.into(),
+            automatic: true,
+        };
+        let explicit = |text: &str| CopyRequest {
+            text: text.into(),
+            automatic: false,
+        };
+        let mut queue = std::collections::VecDeque::new();
+        for drag in 0..1000 {
+            enqueue_copy(&mut queue, auto(&format!("drag {drag}")));
+        }
+        assert_eq!(queue, [auto("drag 999")], "only the latest drag waits");
+        enqueue_copy(&mut queue, explicit("ctrl-c"));
+        assert_eq!(queue, [auto("drag 999"), explicit("ctrl-c")]);
+        enqueue_copy(&mut queue, auto("later drag"));
+        assert_eq!(
+            queue,
+            [explicit("ctrl-c"), auto("later drag")],
+            "the explicit copy stays ahead of the newer drag and is never dropped"
+        );
+    }
+
+    #[test]
+    fn refresh_workers_are_capped() {
+        let held: Vec<_> = std::iter::from_fn(InFlight::claim).take(10).collect();
+        assert_eq!(held.len(), MAX_REFRESH_IN_FLIGHT);
+        assert!(InFlight::claim().is_none());
+        drop(held);
+        assert!(
+            InFlight::claim().is_some(),
+            "finished workers free their slot"
+        );
+    }
+
+    #[test]
+    fn release_copies_route_without_touching_the_clipboard_when_off() {
+        let never = |_: &str| -> std::io::Result<()> { panic!("must not run the clipboard tool") };
+        assert_eq!(
+            release_copy("t".into(), false, false, never, true),
+            ReleaseCopy::Disabled
+        );
+        assert_eq!(
+            release_copy("t".into(), true, true, never, true),
+            ReleaseCopy::Osc52("t".into())
+        );
+        assert_eq!(
+            release_copy("t".into(), true, false, |_| Ok(()), false),
+            ReleaseCopy::Copied
+        );
+        let broken = |_: &str| -> std::io::Result<()> { Err(std::io::Error::other("no tool")) };
+        assert_eq!(
+            release_copy("t".into(), true, false, broken, true),
+            ReleaseCopy::Osc52("t".into())
+        );
+        assert!(matches!(
+            release_copy("t".into(), true, false, broken, false),
+            ReleaseCopy::Failed(_)
+        ));
+        assert_eq!(release_copy_notice(ReleaseCopy::Disabled), None);
+    }
+
+    #[test]
+    fn only_a_mouse_release_that_selects_text_asks_for_a_copy() {
+        let mut doc = doc_of(vec![Line::raw("alpha beta")], false);
+        doc.relayout(40, 20);
+        let body = Rect::new(0, 0, 40, 20);
+        let at = |kind, column| MouseEvent {
+            kind,
+            column,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(!doc.on_mouse(&at(MouseEventKind::Down(MouseButton::Left), 2), body));
+        assert!(!doc.on_mouse(&at(MouseEventKind::Up(MouseButton::Left), 2), body));
+        assert!(!doc.on_mouse(&at(MouseEventKind::Down(MouseButton::Left), 0), body));
+        assert!(!doc.on_mouse(&at(MouseEventKind::Drag(MouseButton::Left), 5), body));
+        assert!(doc.on_mouse(&at(MouseEventKind::Up(MouseButton::Left), 5), body));
+        assert_eq!(doc.selected_text().as_deref(), Some("alpha"));
+        assert!(!doc.on_mouse(&at(MouseEventKind::Up(MouseButton::Left), 5), body));
+    }
+
+    #[test]
     fn preview_selection_does_not_copy_visual_wrap_breaks() {
         let mut doc = doc_of(vec![Line::raw("alpha beta")], false);
         doc.relayout(6, 20);
@@ -3198,6 +4137,73 @@ mod tests {
         assert_eq!(doc.selection.cursor, selection.cursor);
         assert_eq!(doc.rows_key, rows_key);
         assert_eq!(doc.scroll, 1);
+    }
+
+    /// Astra #3: a change saved before the first poll must still reload. The
+    /// baseline is the stamp taken when the shown content was read, not
+    /// whatever the first poll happens to see.
+    #[test]
+    fn a_change_before_the_first_poll_still_reloads() {
+        let path = std::env::temp_dir().join(format!("viewer-watch-{}", std::process::id()));
+        std::fs::write(&path, "version A").unwrap();
+        let request = Request::File {
+            path: path.clone(),
+            line: None,
+        };
+        let shown = load(&request);
+        assert!(shown.stamp.is_some(), "file loads carry their stamp");
+        assert!(
+            !file_refresh_needed(&path, shown.stamp),
+            "nothing changed yet"
+        );
+        std::fs::write(&path, "version B, saved before any poll").unwrap();
+        assert!(
+            file_refresh_needed(&path, shown.stamp),
+            "the very first poll after the save must reload"
+        );
+        let mut doc = shown;
+        let reloaded = load(&request);
+        let new_stamp = reloaded.stamp;
+        apply_diff_refresh(&mut doc, reloaded);
+        assert_eq!(doc.stamp, new_stamp);
+        assert!(
+            !file_refresh_needed(&path, doc.stamp),
+            "settles after reloading"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// An unchanged reload (a `touch`) adopts the new stamp, or the viewer
+    /// would reload the same content every two seconds forever.
+    #[test]
+    fn an_identical_reload_adopts_the_new_stamp() {
+        let mut doc = doc_of(vec![Line::raw("same")], false);
+        let mut refreshed = doc_of(vec![Line::raw("same")], false);
+        let stamp = Some((std::time::SystemTime::UNIX_EPOCH, 4));
+        refreshed.stamp = stamp;
+        apply_diff_refresh(&mut doc, refreshed);
+        assert_eq!(doc.stamp, stamp);
+    }
+
+    /// Astra #4: a refresh started under an earlier load never applies, even
+    /// when the document key matches again (A→B→A).
+    #[test]
+    fn stale_refreshes_are_rejected_by_generation() {
+        let a = Request::File {
+            path: "a.md".into(),
+            line: None,
+        };
+        let b = Request::File {
+            path: "b.md".into(),
+            line: None,
+        };
+        assert!(refresh_is_current(7, &a, 7, Some(&a)));
+        assert!(!refresh_is_current(7, &a, 7, Some(&b)), "another document");
+        assert!(
+            !refresh_is_current(7, &a, 9, Some(&a)),
+            "A, then B, then A again"
+        );
+        assert!(!refresh_is_current(7, &a, 7, None));
     }
 
     #[test]
@@ -3896,31 +4902,44 @@ mod tests {
         assert_eq!(created_tab_root_pane(flaggy), None);
     }
 
+    fn test_scratch(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "herdr-viewer-scratch-{label}-{}",
+            std::process::id()
+        ))
+    }
+
     #[cfg(unix)]
     #[test]
     fn scratch_dir_is_private_to_the_owning_user() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = scratch_dir();
-        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = test_scratch("private");
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::rundir::ensure_private(&dir).unwrap();
+        let meta = std::fs::metadata(&dir).unwrap();
         assert_eq!(
-            mode & 0o777,
+            meta.permissions().mode() & 0o777,
             0o700,
             "scratch dir must not be group/world readable or writable"
         );
+        assert_eq!(meta.uid(), unsafe { libc::geteuid() });
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[cfg(unix)]
     #[test]
     fn write_scratch_file_refuses_to_follow_a_preexisting_symlink() {
         use std::os::unix::fs::symlink;
-        let dir = scratch_dir();
+        let dir = test_scratch("symlink");
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::rundir::ensure_private(&dir).unwrap();
         let victim = dir.join(format!("aa-victim-{}.txt", std::process::id()));
         let link = dir.join(format!("aa-link-{}.ctl", std::process::id()));
         std::fs::write(&victim, "original victim contents").unwrap();
         let _ = std::fs::remove_file(&link);
         symlink(&victim, &link).unwrap();
 
-        write_scratch_file(&link, "payload").unwrap();
+        write_scratch_file_in(&link, "payload", &dir).unwrap();
 
         // The symlink must have been replaced by a real file, and the
         // victim it used to point at must be untouched.
@@ -3936,8 +4955,120 @@ mod tests {
             "original victim contents"
         );
 
-        let _ = std::fs::remove_file(&victim);
-        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Every control-file operation gates on the parent being a verified
+    /// private directory, not just a path that looks like ours — a stale or
+    /// hijacked parent must not be trusted just because it used to be ours.
+    #[cfg(unix)]
+    #[test]
+    fn control_operations_refuse_a_path_whose_parent_is_not_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-viewer-untrusted-parent-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Group/world readable: not private by rundir's definition.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let control = dir.join("untrusted.ctl");
+
+        assert!(write_scratch_file_in(&control, "payload", &dir).is_err());
+        assert!(!control.exists(), "write must not have happened");
+
+        std::fs::write(&control, "planted").unwrap();
+        assert_eq!(read_control_in(&control, &dir), None);
+
+        remove_control_file_in(&control, &dir);
+        assert!(
+            control.exists(),
+            "delete must refuse to touch a file under an unverified parent"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A metadata-derived control path naming some OTHER directory we own
+    /// privately (an attacker's own `~/.ssh`, say, if it happens to be 0700)
+    /// must be refused just as firmly as a non-private one — `control_path_ok`
+    /// requires confinement to `scratch_dir()` itself, not merely that
+    /// *some* private directory is involved.
+    #[cfg(unix)]
+    #[test]
+    fn control_operations_refuse_a_path_confined_to_a_different_private_directory() {
+        let expected = test_scratch("expected-private-dir");
+        let dir = test_scratch("other-private-dir");
+        let _ = std::fs::remove_dir_all(&expected);
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::rundir::ensure_private(&expected).unwrap();
+        crate::rundir::ensure_private(&dir).unwrap();
+        assert!(crate::rundir::is_private(&dir), "test setup sanity check");
+        let control = dir.join("not-ours.ctl");
+
+        assert!(write_scratch_file_in(&control, "payload", &expected).is_err());
+        assert!(!control.exists(), "write must not have happened");
+
+        std::fs::write(&control, "planted").unwrap();
+        assert_eq!(read_control_in(&control, &expected), None);
+
+        remove_control_file_in(&control, &expected);
+        assert!(
+            control.exists(),
+            "delete must refuse to touch a file outside scratch_dir(), \
+             even in a directory we privately own"
+        );
+
+        let _ = std::fs::remove_dir_all(expected);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The confinement checks in `control_path_ok` must not reject a
+    /// legitimate path directly under `scratch_dir()` itself.
+    #[cfg(unix)]
+    #[test]
+    fn control_operations_accept_a_path_directly_under_scratch_dir() {
+        let dir = test_scratch("accepted");
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::rundir::ensure_private(&dir).unwrap();
+        let control = dir.join(format!("accepted-{}.ctl", std::process::id()));
+        let _ = std::fs::remove_file(&control);
+
+        write_scratch_file_in(&control, "close", &dir).unwrap();
+        assert!(control.exists());
+        assert_eq!(read_control_in(&control, &dir), Some(Request::Close));
+
+        remove_control_file_in(&control, &dir);
+        assert!(
+            !control.exists(),
+            "delete must succeed inside scratch_dir()"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn control_token_falls_back_to_a_verified_legacy_file() {
+        let current = test_scratch("migration-current");
+        let legacy = test_scratch("migration-legacy");
+        let _ = std::fs::remove_dir_all(&current);
+        let _ = std::fs::remove_dir_all(&legacy);
+        crate::rundir::ensure_private(&current).unwrap();
+        crate::rundir::ensure_private(&legacy).unwrap();
+        std::fs::write(legacy.join("preview.ctl"), "close").unwrap();
+
+        assert_eq!(
+            control_from_token_in("preview.ctl", &current, &legacy),
+            legacy.join("preview.ctl")
+        );
+        std::fs::write(current.join("preview.ctl"), "new").unwrap();
+        assert_eq!(
+            control_from_token_in("preview.ctl", &current, &legacy),
+            current.join("preview.ctl")
+        );
+
+        let _ = std::fs::remove_dir_all(current);
+        let _ = std::fs::remove_dir_all(legacy);
     }
 
     #[test]
@@ -3998,6 +5129,64 @@ mod tests {
     }
 
     #[test]
+    fn git_show_treats_a_dash_prefixed_ref_as_data_not_an_option() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-sidebar-dash-ref-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "initial",
+            ][..],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let head = String::from_utf8(head.stdout).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["update-ref", "refs/tags/--output=pwned.txt", head.trim()])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let doc = load_show(&root, "--output=pwned.txt", None);
+        assert!(!doc.lines.is_empty());
+        assert!(
+            !root.join("pwned.txt").exists(),
+            "the ref name must never become a git-show option"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn line_target_anchors_plain_and_markdown_source_previews() {
         let root =
             std::env::temp_dir().join(format!("herdr-sidebar-line-target-{}", std::process::id()));
@@ -4017,15 +5206,8 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the optional glow executable"]
     fn glow_markdown_returns_styled_spans() {
-        // Skip if glow is not installed
-        if std::process::Command::new("glow")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            return;
-        }
         let md = "# Heading\n\n**bold** and `code`\n";
         let lines = glow_markdown(md, 80);
         assert!(lines.is_some(), "glow_markdown returned None");
@@ -4041,6 +5223,193 @@ mod tests {
             has_styled,
             "glow_markdown returned no styled spans — ANSI not parsed"
         );
+    }
+
+    #[test]
+    fn glow_rendered_markdown_uses_the_body_width_without_generic_rewrap() {
+        let rendered = vec![Line::raw("preformatted table")];
+        let fallback = vec![Line::raw("markdown source")];
+        let (lines, numbered, glow_width) = choose_text_render(Some(rendered), || fallback, 80);
+        let doc = Doc {
+            name: "table.md".into(),
+            context: String::new(),
+            lines,
+            numbered,
+            media: None,
+            scroll: 0,
+            wrap: glow_width.is_none(),
+            glow_width,
+            rows: Vec::new(),
+            rows_key: None,
+            pending_src: None,
+            selection: PreviewSelection::default(),
+            stamp: None,
+        };
+        assert!(!doc.wrap, "glow output must not be generically re-wrapped");
+        assert!(!doc.numbered, "glow formats its own layout, no gutter");
+        assert_eq!(doc.glow_width, Some(80));
+        assert!(!glow_needs_reload(&doc, 80));
+        assert!(glow_needs_reload(&doc, 60));
+    }
+
+    #[test]
+    fn glow_arguments_always_carry_theme_width_and_stdin_sentinel() {
+        assert_eq!(
+            glow_args(39, true),
+            ["--style", "light", "--width", "39", "-"]
+        );
+        assert_eq!(
+            glow_args(120, false),
+            ["--style", "dark", "--width", "120", "-"]
+        );
+    }
+
+    #[test]
+    fn click_cleanup_only_kills_label_only_resumed_husks() {
+        let json = r#"{"result":{"panes":[
+            {"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","label":"Sidebar"},
+            {"pane_id":"w1:p2","tab_id":"w1:t1","workspace_id":"w1",
+             "tokens":{"herdr-sidebar-preview":"100","hs-preview-path":"0123456789abcdef","hs-preview-inline":"1"}},
+            {"pane_id":"w1:p3","tab_id":"w1:t2","workspace_id":"w1","label":"notes.md · preview"}
+        ]}}"#;
+        let previews = previews_in(json);
+        let stamped = previews.iter().find(|p| p.pane_id == "w1:p2").unwrap();
+        assert!(stamped.stale && !stamped.resumed);
+        let actions = stale_cleanup(&previews, json);
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert!(matches!(
+            &actions[0],
+            StaleCleanup::CloseTab { tab_id, .. } if tab_id == "w1:t2"
+        ));
+    }
+
+    fn preview(pane: &str, tab: &str, inline: bool, stale: bool) -> PreviewPane {
+        PreviewPane {
+            pane_id: pane.into(),
+            tab_id: tab.into(),
+            workspace_id: "w1".into(),
+            doc_token: String::new(),
+            pinned: false,
+            control: PathBuf::from(format!("{pane}.ctl")),
+            stale,
+            dedicated: !inline,
+            inline,
+            origin_tab_id: tab.into(),
+            resumed: false,
+        }
+    }
+
+    /// A stale (dead-but-stamped) viewer in ANOTHER tab must not affect a
+    /// click at all: no wait, no refusal, just not a routing target.
+    #[test]
+    fn unrelated_stale_viewers_neither_block_nor_receive_clicks() {
+        let previews = vec![
+            preview("w1:p9", "w1:t9", false, true),
+            preview("w1:p8", "w1:t8", true, true),
+            preview("w1:p2", "w1:t1", true, false),
+        ];
+        for inline in [false, true] {
+            assert!(unresponsive_inline_in(&previews, inline, "w1:t1").is_none());
+        }
+        let routed: Vec<_> = previews
+            .iter()
+            .filter(|p| routable(p, true, "w1:t1"))
+            .map(|p| p.pane_id.as_str())
+            .collect();
+        assert_eq!(routed, vec!["w1:p2"]);
+        assert!(!previews.iter().any(|p| routable(p, false, "w1:t1")));
+    }
+
+    #[test]
+    fn a_stale_inline_viewer_in_the_callers_tab_is_reported_not_duplicated() {
+        let previews = vec![preview("w1:p2", "w1:t1", true, true)];
+        assert_eq!(
+            unresponsive_inline_in(&previews, true, "w1:t1").map(|p| p.pane_id.as_str()),
+            Some("w1:p2")
+        );
+        assert!(unresponsive_inline_in(&previews, false, "w1:t1").is_none());
+        assert!(!routable(&previews[0], true, "w1:t1"));
+    }
+
+    /// A takeover close that failed must not leave `close` in the control
+    /// file, or the next loop iteration would take the "close anyway" branch
+    /// without the user's second deliberate q.
+    #[test]
+    fn a_failed_close_never_leaves_the_close_request_behind() {
+        let file = Request::File {
+            path: PathBuf::from("/repo/a.rs"),
+            line: None,
+        };
+        let restored = control_after_failed_close(&Some(file.clone()));
+        assert_eq!(parse_request(&restored), Some(file));
+        assert_eq!(parse_request(&control_after_failed_close(&None)), None);
+    }
+
+    #[test]
+    fn preview_footer_keeps_close_visible_when_narrow() {
+        assert_eq!(preview_hint(&["space/b page"], 12), " q close");
+        let wide = preview_hint(&["space/b page", "↑↓ scroll", "w: wrap on"], 200);
+        assert!(wide.starts_with(" q close  space/b page"), "{wide}");
+        assert!(wide.ends_with("Ctrl/Cmd+C copy"), "{wide}");
+        assert!(
+            preview_hint(&["space/b page", "↑↓ scroll"], 30)
+                .chars()
+                .count()
+                <= 30
+        );
+    }
+
+    #[test]
+    fn sidebar_escape_never_kills_a_stamped_viewer() {
+        assert_eq!(esc_close_action(false, false), EscClose::Request);
+        assert_eq!(esc_close_action(true, false), EscClose::Request);
+        assert_eq!(esc_close_action(true, true), EscClose::Kill);
+    }
+
+    #[test]
+    fn heartbeat_follows_wall_clock_across_suspend_and_corrections() {
+        assert!(!heartbeat_due(1_000, 1_004));
+        assert!(heartbeat_due(1_000, 1_005));
+        // Resumed after an hour asleep: due at once, not after 5 more seconds.
+        assert!(heartbeat_due(1_000, 4_600));
+        // Clock corrected backwards: stamp again rather than go silent.
+        assert!(heartbeat_due(1_000, 900));
+    }
+
+    #[test]
+    fn orphan_sweep_keeps_the_control_of_a_present_stale_viewer() {
+        let dir = std::env::temp_dir().join(format!("herdr-viewer-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::rundir::ensure_private(&dir).unwrap();
+        let kept = dir.join("p-1-a-0.ctl");
+        let orphan = dir.join("p-1-b-0.ctl");
+        let old = std::time::SystemTime::now() - Duration::from_secs(600);
+        for path in [&kept, &orphan] {
+            std::fs::write(path, "close").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let present = PreviewPane {
+            pane_id: "w1:p2".into(),
+            tab_id: "w1:t1".into(),
+            workspace_id: "w1".into(),
+            doc_token: String::new(),
+            pinned: false,
+            control: kept.clone(),
+            stale: true,
+            dedicated: false,
+            inline: true,
+            origin_tab_id: "w1:t1".into(),
+            resumed: false,
+        };
+        sweep_orphan_controls_in(&dir, &[present]);
+        assert!(kept.exists(), "a present (stale) viewer keeps its control");
+        assert!(!orphan.exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

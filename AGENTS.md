@@ -3,7 +3,7 @@
 **This file is a living doc — always capture findings.** Whenever you discover something
 non-obvious the hard way (a herdr behavior, a Windows quirk, a manifest gotcha, a build issue),
 record it here in the relevant section before finishing the task, the way the Windows caveats
-below were captured. If you're working in a feature worktree, commit the CLAUDE.md update on
+below were captured. If you're working in a feature worktree, commit the AGENTS.md update on
 your branch so it lands on main with the merge.
 
 One herdr plugin, a VS Code-style sidebar for the terminal, as a **self-contained Rust crate**:
@@ -31,6 +31,11 @@ cargo build --release
 cargo test
 cargo clippy -- -D warnings
 ```
+
+CI uses the LATEST stable toolchain (`dtolnay/rust-toolchain@stable`), so a stale local
+`stable` can pass clippy while CI fails on a newly deprecated API (v0.15.1: `fetch_update` →
+`try_update`, which is also newer than our `rust-version = 1.89` MSRV — rewrite instead of
+renaming). Run `rustup update stable` (or `cargo +<latest> clippy`) before tagging a release.
 
 `plugins/herdr-sidebar/scripts/.gitattributes` pins every shell script to LF. The
 repository has Windows contributors and `core.autocrlf` is common, but these files are
@@ -77,6 +82,15 @@ executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launch
   single-quoted here-string: `git commit -m @'…"quoted text"…'@` splits the message at the
   embedded `"` into multiple pathspec args (bit an agent live). Write multi-line/quoted
   commit messages to a temp file and use `git commit -F <file>` instead.
+- **herdr started from PowerShell 7 poisons `powershell` children's module path** (issue #96,
+  reproduced locally): herdr passes pwsh's `PSModulePath` unchanged to the Windows PowerShell 5.1
+  that runs our build/redeploy scripts. 5.1 then autoloads PS7's CoreCLR modules first, which
+  claim but cannot provide cmdlets such as `Get-FileHash`/`Select-String`, so the installer
+  reported a "checksum" failure and fell back to a source build. A PowerShell parent fixes the
+  path up itself, so only a NATIVE parent (herdr, or Git Bash in tests) reproduces it. Every
+  Windows script now resets `PSModulePath` to 5.1's own three module directories as its first
+  statement, and hashing uses .NET (`Get-HsSha256`). `test-fetch-or-build.ps1` keeps a decoy
+  `Microsoft.PowerShell.Utility` module on the path as a regression; it fails without the reset.
 - **PS 5.1 prepends a UTF-8 BOM when piping into a native process's stdin** (`$json | my.exe`
   delivers `EF BB BF{...}`; verified live by both plugins). serde_json rejects a BOM before
   `{`, so anything parsing herdr JSON from stdin must strip a leading `\u{feff}` first (see
@@ -118,7 +132,56 @@ executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launch
   reach them — the lock only clears when that other session restarts. Rename-aside (above)
   still unblocks the build.
 
-### Release flow (verified for v0.7.0)
+### Release flow
+
+- Settings shows the running binary's Cargo version. `updates.rs` checks stable GitHub
+  releases on a background thread (bounded curl request, 30-minute cache); local/third-party
+  registrations never offer self-update. The explicit Update action uses Herdr's staged
+  `plugin install --ref vX.Y.Z --yes`, preserving the existing checksum-verifying build
+  scripts, then verifies the registered version before invoking the NEW installation's
+  refresh action. Herdr 0.9.1 exposes install only through its CLI, not the socket API;
+  its plugin action runner waits for child completion without an action timeout.
+  Update helpers serialize through a private runtime lock (`updates/install.lock`, an OS lock
+  the kernel releases on death) and keep install/error logs under the runtime `updates`
+  directory. Windows subprocesses use CREATE_NO_WINDOW with redirected streams. Local
+  development deployments must still build and refresh explicitly; no automatic background
+  installs.
+- Update flow invariants (`updates.rs`, `ensure::refresh_all`; hermetic tests drive both
+  through injected `UpdateHost` / `RefreshHost` fakes — no production URL/env overrides):
+  - The updater `set_current_dir`s into the private runtime dir before installing: herdr runs
+    actions with cwd = plugin root, and a process's cwd is the one handle that can block the
+    managed-directory rename on Windows.
+  - It ALWAYS hands off to the refresh action, even when the latest release is already
+    installed: a retry after an install whose refresh failed must restart the sidebars that
+    still offer the update. Install only happens for a strictly newer, verified release.
+  - Status is `installing` → `refreshing` → `finished`/`failed`, and `finished` is written by
+    the REFRESH action once every sidebar really restarted — never when it is merely queued.
+    An in-flight record whose install lock is free and that is older than 60s reads as
+    "Update interrupted" (retryable), so a killed updater cannot pin "installing…" for 30 min.
+  - The Settings row requests the update action on a worker thread (herdr runs actions
+    asynchronously, but the IPC round trip must not sit on the TUI loop).
+  - **Refresh never hard-closes a sidebar.** SCM commit drafts are NOT persisted per keystroke
+    (only on close/quit/switch paths), so `pane.close` would lose them. Every sidebar gets
+    Ctrl+Q (save drafts, close self) — even one whose snapshot said "starting", since it may be
+    running by the time input lands. Refresh waits up to 5s, reopens only the views whose panes
+    actually closed, and counts a reopen only when a fresh sidebar with that view's token is
+    present afterwards (`open` can return Ok without docking). Survivors (unsaved draft that
+    failed to save, hung TUI) keep running the old build and are reported. Preview, editor,
+    inline and takeover viewers are never closed. Sidebar-only tabs are not touched (closing
+    the last pane closes the tab) and are reported, so such a refresh is not "finished".
+- Live Windows evidence (maintainer host, herdr 0.9.1, 2026-09-30, disposable isolated session
+  with `XDG_CONFIG_HOME`/`XDG_STATE_HOME` redirected and socket/context env removed):
+  a REAL staged `plugin install` from v0.13.0 to v0.14.0 passed while an old v0.13 Sidebar was
+  running in the session — a loaded exe alone does NOT block herdr's managed-directory swap.
+  A failing install (nonexistent `--ref`) preserved the v0.14 registration and binary. The old
+  `.tmp-install` / previous checkout stayed behind because the still-running old exe prevented
+  full cleanup; nothing auto-deletes old viewers. A long scratch root made the source-build
+  fallback fail with MSVC LNK1104 (MAX_PATH); a short root succeeded. The NEW updater could
+  not be exercised end-to-end because published v0.14 has no refresh action yet. With fresh
+  debug builds of the new code in the same kind of isolated managed session, a typed but
+  unsubmitted SCM draft (`keep-this-draft`) survived `--refresh-sidebars`: the sidebar came
+  back with a NEW pane id and the draft visible, and a second sidebar in the session was
+  refreshed too (`target/refresh-smoke.ps1`, maintainer-local).
 
 - Bump the version in THREE files: `Cargo.toml`, `herdr-plugin.toml`, and `Cargo.lock`
   (any cargo command regenerates the lock entry). Commit as `vX.Y.Z`, `git tag vX.Y.Z`,
@@ -130,6 +193,8 @@ executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launch
 - Prebuilt selection is version-based and checksum-verified. Windows needs BOTH the main binary
   and the GUI-subsystem ensure sidecar; a partial download must fall back to the source build.
 - Release assets use `herdr-sidebar[-ensure]-<rust-target>[.exe]` plus `SHA256SUMS`.
+  Linux publishes both x86-64 and ARM64 musl binaries; the Unix installer maps
+  `aarch64`/`arm64` hosts to `aarch64-unknown-linux-musl` before falling back to source.
   Platform-gated `[[build]]` entries fetch only the crate's declared version, verify before
   moving either binary into `target/release`, and fall back to `cargo build --release` for
   unsupported targets, missing assets, or mismatches. The `HS_*` seams are enabled only by
@@ -140,21 +205,22 @@ executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launch
   a pull request") is bypassable as repo admin — the push prints a rule-violation warning
   but succeeds.
 - Before merging fetched contributor commits, inspect `gh pr diff N --name-only | rg -i
-  '^\.(claude|codex)/|^CLAUDE\.md$|^\.github/workflows/'` for agent instructions and
+  '^\.(claude|codex)/|^AGENTS\.md$|^CLAUDE\.md$|^\.github/workflows/'` for agent instructions and
   workflow changes. `.claude/commands/` and `.codex/prompts/` are
   maintainer-local, ignored, rejected by ordinary CI, and independently rejected by a
   `pull_request_target` workflow that never checks out contributor code. A PR can still alter
-  `CLAUDE.md`, tracked skills, or workflows, so review those paths as instructions, not data.
+  `AGENTS.md`, add another root instruction file, or alter tracked skills/workflows, so review
+  those paths as instructions, not data.
 
 ### Testing hooks headless (no TUI attached)
 
 - Bare `herdr server` STARTS a foreground server (it does not print help) and restores the
   persisted session — all workspaces and panes respawn. Handy for exercising plugin hooks
   from a script; test in throwaway workspaces and close them after.
-- The ensure hooks only dock into the FOCUSED tab: `workspace create --no-focus` fires
-  workspace.created but nothing docks until `herdr workspace focus <id>`. With no TUI
-  client attached, focus changes are invisible to the user — still restore the previous
-  focus when done.
+- Creation hooks dock into their event scope even when `workspace create --no-focus` or
+  `tab create --no-focus` targets the background. After docking they re-read `pane.list` and
+  restore the previously focused pane only if the split/swap itself focused the new sidebar;
+  a concurrent intended focus transition must win.
 - Drive the live TUI for verification with `pane send-keys <id> s` (⚙ Settings) etc., then
   `pane read <id> --source visible` to assert on the rendered modal.
 
@@ -441,7 +507,16 @@ HACKING.md — budget time for that before promising a patched build.
 - A focus event may yield when the launcher lock is held because another focus event follows, but
   `tab.created` is discrete and must block for the OS lock or a preview tab can permanently miss
   its sidebar (issue #32). Herdr's `EventEnvelope` serializes the JSON discriminator as
-  `tab_created`; manifest hook names remain dotted (`tab.created`).
+  `tab_created`; manifest hook names remain dotted (`tab.created`). Creation hooks still dock
+  their event scope when it is in the background, then conditionally repair focus only when the
+  new sidebar stole it, so `--no-focus` remains authoritative without reopening issue #32's
+  missed-preview-tab race. Ordinary focus hooks restore the scoped pane because their first
+  global snapshot can still point at the tab/workspace the client just left.
+- A crashing startup must never create an unbounded `REPLACE` loop. Quiet hooks persist a
+  per-tab replacement budget in the private runtime directory: three attempts per minute, then
+  leave the corpse in place until another event after the window or an explicit sidebar action.
+  Focus/swap events do not clear it; explicit actions bypass and clear it, and expired marker
+  files are swept after two windows.
 - **Stamp the heartbeat on EVERY event-loop iteration, not only in the poll-timeout
   branch**: sustained input with <500ms gaps (held-key auto-repeat, a long paste) keeps
   `event::poll` returning true, starving a timeout-branch heartbeat until the launcher
@@ -522,8 +597,8 @@ HACKING.md — budget time for that before promising a patched build.
 - "Reveal in File Explorer" opens a selected directory itself; only files are revealed by
   opening their parent with the file selected. Applying file-style reveal semantics to folders
   lands one level too high and looks like the clicked tree row was ignored. Pass the row/menu's
-  known directory bit into `actions::reveal`; restatting with `Path::is_dir()` follows symlinks
-  and can disagree with Explorer's `DirEntry::file_type()` row classification.
+  known directory bit into `actions::reveal`. Explorer deliberately restats symlinks once while
+  building rows so links to directories are expandable; downstream actions must trust that bit.
 - List UX invariants (both views): NOTHING is highlighted until the user selects
   (hover stays subtle); the wheel scrolls the VIEW only (`scroll_view`) and never
   moves the selection; keyboard nav snaps the view to the selection; overflow shows a
@@ -680,7 +755,10 @@ HACKING.md — budget time for that before promising a patched build.
 
 - **Multi-repo**: `Git::discover_all` lists the repo containing the cwd plus child repos two
   levels down (`.git` dir or file), skipping `target`/`node_modules`/`.claude` (the agent
-  worktrees under `.claude/worktrees` would otherwise show up as repos). With >1 repo the
+  worktrees under `.claude/worktrees` would otherwise show up as repos). The scan NEVER follows
+  directory symlinks (`DirEntry::file_type()`, issue #87): from `~`, a link into a cloud mount
+  (OneDrive's File Provider trash on macOS) blocked `stat` forever and the sidebar never drew a
+  frame. With >1 repo the
   layout mirrors VS Code's: each repo section carries its OWN inline message box (3-line
   bordered list row) and ✓ Commit button, and the repo header row shows `⎇branch*` (star =
   dirty) plus clickable ⟳ sync / ✓ commit icons in the fixed last-6 columns. List rows now
@@ -707,7 +785,9 @@ HACKING.md — budget time for that before promising a patched build.
   and never force, stash, discard, or otherwise mutate work to make the switch succeed.
 - Periodic Source Control status/drawer refresh backs off while its pane is unfocused, just
   like Explorer decorations. Suggestion/sync worker results are still collected first so a
-  hidden pane never strands completed background work.
+  hidden pane never strands completed background work. A pane launched with
+  `HERDR_SIDEBAR_BACKGROUND_REFRESH=1` (read once at startup, `state::BACKGROUND_REFRESH_ENV`)
+  skips only that focus guard, for passive monitor panes; Explorer is unaffected.
 - Hotkey hints render as keycap chips (`wrap_hints` takes `(key, label)` pairs, shared in
   `ui.rs`). They live in the ⚙ Settings modal; the FOOTER copy is opt-in via the
   "Footer hotkeys" setting (persisted as `hotkeys` in the state file, default hidden —
@@ -727,12 +807,81 @@ HACKING.md — budget time for that before promising a patched build.
   closure requires a post-move `hs-preview-dedicated` ownership token AND an all-plugin pane
   whitelist; if the user added a shell/agent pane, only the viewer closes.
 
-### Preview tabs (TRIAL — combined PRs #15 + #17, branch `trial/preview-tabs-wrap`)
+### Preview placement and tabs
 
-Previews follow **VS Code's editor-tab semantics**, mapped onto herdr TABS. This
-REPLACED the old full-size park/restore mode: `preview_full`, `park_others`,
-`restore_parked`, `owner_frac`/`enforce_owner_width` and the "Full-size preview"
-setting are all gone.
+`Preview opens in` now cycles `tab` (unchanged default), `pane`, and `replace`.
+`replace` is temporary takeover (#64): `takeover.rs` journals the original split
+tree and terminal identities under a private, session-and-tab-keyed path BEFORE
+moving working panes to a snoozed background tab, then opens one inline viewer.
+All layout work holds `LaunchLock`, so queued creation hooks cannot dock a sidebar
+into the parking tab. Invariants (each has a hermetic test against a simulated
+host in `takeover::tests`):
+- **A present viewer is never moved or closed by recovery**, whatever its heartbeat:
+  a stale stamp can be a suspended laptop or a stalled loop holding unsaved edits.
+  Only the journal's own closing viewer (`restore(tab, closing_viewer)`), or a
+  viewer that is gone, lets a restore run. Replace clicks over a present viewer
+  report instead of spawning another.
+- **Restore is best-effort and always finishes**: panes the user closed or moved to
+  a third tab are pruned from the tree; a hidden sidebar is replaced by the first
+  surviving pane as anchor; panes added during the preview stay where they are; a
+  subtree whose move fails stays in the parking tab, relabelled
+  `Working panes (not restored)` and un-snoozed. The journal is deleted either way,
+  so a lost pane can never trap the tab. A closed previewed tab (or ids changed by a
+  server restart) abandons the journal on the next hook sweep of THIS session only.
+- **Hook retries are budgeted** (3 real attempts per 60s). A hook that finds the
+  viewer still open does not spend budget, so focus bursts never delay recovery.
+- If the viewer's own restore fails, the first q/Esc shows why and puts the
+  control file back to the current document; only a second deliberate close
+  abandons the layout (panes stay in the relabelled tab).
+- **Running-TUI transport (M1) — partly verified.** Takeover moves RUNNING user panes
+  across tabs, and the v0.8.0 finding above says moving a running crossterm TUI can
+  invalidate its Windows input handle. Evidence on the maintainer's Windows 11 host
+  (herdr 0.9.1, 2026-09-29), both ignored live tests run serially (8.91s), PASSED:
+  `takeover::tests::live_parked_running_tui_still_takes_input_after_restore` parked a
+  RUNNING read-only crossterm preview viewer in the temporary tab, restored it, and it
+  still took a key afterwards; `takeover::tests::live_takeover_roundtrip` restored
+  left/right-docked nested geometry exactly and recovered after a forced viewer close.
+  Both need an attached Herdr session (`HERDR_ENV=1`) and a fresh build on PATH, and
+  touch only their own disposable tabs. **Still untested:** third-party TUIs (Claude
+  Code, vim, other agents) and other hosts/versions — check those manually before
+  recommending `replace` on Windows.
+
+Stale previews are never killed from routing or Esc anymore: a click excludes a
+stamped-but-stale viewer from routing without waiting (an unrelated stale viewer
+costs nothing; a stale inline viewer in the caller's own tab is handed the request
+and reported), and the sidebar's Esc writes a close request. Only label-only panes
+from a server resume (no heartbeat token) are closed directly, and the orphan
+control sweep keeps a present viewer's control file. The viewer's heartbeat
+cadence uses wall-clock time: `Instant` stops during suspend, so after resume the
+old stamp would stay stale for up to 5s while recovery reads it.
+The ignored `takeover::tests::live_takeover_roundtrip` test requires an attached
+Herdr session and the newly built sidebar on PATH; it creates disposable test tabs,
+checks left/right docks with nested work panes, and verifies real `q` restoration.
+
+SCM tree/list mode (#66/#76) is toggled with `t`, the title action, or Settings.
+The mode is ONE global setting (`scm_tree_view`), re-read on every tick like the
+other shared settings; a per-folder copy used to override it forever. Collapsed
+folders persist per repository and staged/unstaged scope and are pruned to folders
+that still exist — judged against ALL current compacted folder paths, not the visible
+rows (a child hidden inside a collapsed parent keeps its state), and never against a
+not-yet-loaded, empty status. Folder
+stage/unstage goes through `Git::stage_under` / `Git::unstage_under` — batched and
+nested-repository-safe, never one process per file on the UI thread. The folder
+button only fires on the hovered row (a tap folds instead); keyboard parity is
+←/→ fold and `m` for a Stage/Unstage Folder menu.
+The branch picker supports New branch (#77); branch deletion first uses `-d`
+and asks separately before `-D` (#78). Keep `--` before branch names in both paths.
+Preview Space/`b` page down/up (#73); Shift+Space is indistinguishable in legacy
+terminal keyboard mode and must not be used as the sole page-up gesture.
+
+Windows agent-command note: if ordinary tool shells create visible Windows Terminal
+windows, run shell calls with a headless PTY (`tty: true`) and `login: false`.
+MCP helper processes can also create startup consoles; identify their parent PID
+before stopping any, and never kill the shared WindowsTerminal process.
+
+Tab placement follows **VS Code's editor-tab semantics**, mapped onto herdr TABS.
+It replaced the original pane-ID-keyed park/restore implementation; the optional
+`replace` mode above uses a new journal instead of reviving that implementation.
 
 - Clicking a file opens it in **its own tab** and jumps there. Clicking a different
   file **overwrites that same tab** — it is EPHEMERAL, and its tab label reads
@@ -767,9 +916,10 @@ setting are all gone.
   leaving a frozen first frame and a control file nobody reads. Viewer pane labels keep stable
   ` · preview` / ` · editor` suffixes so a server-resumed pane with lost tokens is still
   reclaimable; the classifier also retains the legacy `Preview · ` / `Editor · ` prefixes.
-- Preview routing treats a missing heartbeat as stale, includes label-only server-resumed viewers
-  as cleanup candidates, and closes their whole tab only when every pane is recognizably plugin-owned;
-  a real shell/agent pane forces narrow viewer cleanup. Redeploy closes/restarts sidebar panes but NEVER kills the shared
+- Preview routing never routes to a stale viewer, but only CLOSES label-only server-resumed
+  viewers (no heartbeat token) — their whole tab only when every pane is recognizably
+  plugin-owned; a real shell/agent pane forces narrow viewer cleanup. A stamped-but-stale
+  viewer may hold unsaved edits and is left alone (see Preview placement above). Redeploy closes/restarts sidebar panes but NEVER kills the shared
   `herdr-sidebar` process name wholesale: a spared Preview may contain an unsaved editor buffer.
 - Herdr truncates long metadata token values (an absolute `%TEMP%` control path was shortened to
   a different, valid-looking filename). Control metadata therefore carries only a compact basename,
@@ -815,6 +965,22 @@ setting are all gone.
   key also preserves an explicit manual root across restarts. v0.10 label-only entries migrate
   only when the remembered path contains the tab's spawn cwd. Every successful manual or
   followed re-root is written to `roots.json`; a read-only `load_root` API is dead behavior.
+- **Herdr labels an unnamed workspace after its live folder** (verified live, 0.9.3: created
+  at `alpha` → label `alpha`; `cd beta` → label `beta`). A workspace created from another
+  project's folder therefore starts with THAT project's label and key, so its sidebar used to
+  write its followed `cd` over the other project's `roots.json` entry (user-reported: sx-flow's
+  sidebar showed GCP). `RootMemory` re-reads the label at SAVE time — the follow lands ~5s after
+  the `cd`, when the label has already moved. A failed or unknown label lookup DEFERS the save
+  (the in-process root still follows) instead of falling back to the startup label, which would
+  recreate the overwrite. Retries wait 15s from when the previous attempt FINISHED — the lookup
+  is a socket call on the UI thread, and timing from its start let a 5s timeout retry instantly.
+  Throttled loop iterations never move that clock. Quitting makes one last attempt
+  (`RootMemory::flush`), and so do the apps' own close paths (hide, Ctrl+Q, refresh's graceful
+  close) through `flush_pending_root`, because closing our own pane kills the process before the
+  outer loop runs; if the label is still unknown the choice is reported, not saved under a guess.
+  Only a process that never had a label saves by folder. The root is also resolved once per process: a view
+  switch keeps the in-process root instead of re-reading `roots.json`, which was the channel that
+  pushed a clobbered entry into an already-running, healthy sidebar.
 - The ensure hook roots a docked sidebar from **the event's own tab**
   (`event_scope_in` → `launch_decision_in` / `focused_pane_in`): during a workspace
   switch the globally focused pane is still the space you came from. Both the Unix main-binary
@@ -840,6 +1006,18 @@ setting are all gone.
   The refresh runs on a worker thread so a slow Git process cannot starve the viewer heartbeat;
   unchanged output is left in place so a mouse selection is not erased every two seconds.
   Staged rows show `--cached`; untracked files render via `diff --no-index NUL <file>`.
+  Plain file previews ride the same 2s tick but stat first: they reload only when the file's
+  modified time or size changed, and media previews are always replaced on reload. The stat runs
+  on the refresh WORKER, never the event loop: on a stalled SMB/cloud drive `metadata()` can block
+  forever, and on the loop it froze input, heartbeat and takeover restore. The baseline is the
+  stamp `load()` takes BEFORE reading (`Doc::stamp`), so a save that lands before the first poll
+  is not silently adopted as "unchanged"; an identical reload (a `touch`) still adopts the new
+  stamp or it would reload every tick. Every fresh document load bumps `LOAD_GENERATION`; a
+  refresh started under an older generation is dropped rather than awaited (a stuck worker for
+  file A must not block refreshes of B) and never applied (A→B→A, leaving edit mode). Dropping a
+  receiver cannot cancel a thread blocked in the kernel, so at most `MAX_REFRESH_IN_FLIGHT` (2)
+  refresh workers may exist; new refreshes pause while both are stuck, and a refresh unanswered
+  for 30s is abandoned so the same document can retry within that cap.
 
 ### Long-line wrapping in the preview (`src/wrap.rs`)
 
@@ -872,7 +1050,30 @@ setting are all gone.
 - The line-number gutter numbers the FIRST row of a source line and indents
   continuations to the same column, like an editor.
 - Read-only previews still support terminal-native interaction despite mouse capture: click/drag
-  selects rendered text, Shift+click extends it, and Ctrl/Cmd+C copies it. Selection preserves
+  selects rendered text, Shift+click extends it, and Ctrl/Cmd+C copies it. Releasing a drag
+  also copies, because mouse capture stops herdr from doing its own copy-on-select — but only
+  while herdr's `[ui] copy_on_select` is on (default). The viewer re-reads herdr's config on each
+  release (`HERDR_CONFIG_PATH`, then `XDG_CONFIG_HOME`, then on Windows `%APPDATA%`,
+  `%USERPROFILE%\AppData\Roaming`, `$HOME/.config`, elsewhere `~/.config`, matching herdr 0.9's
+  `config/io.rs`) and parses it with the `toml` crate after stripping BOMs, like herdr: a
+  line-based reader missed `[ ui ]`, `["ui"]`, dotted keys, inline tables and a leading BOM, and
+  silently kept copying. Like herdr's live loader, an unreadable or half-edited file keeps the
+  LAST GOOD value (a missing file means defaults), so saving config.toml mid-edit cannot briefly
+  re-enable copying. ALL preview copies — release AND Ctrl/Cmd+C — run on ONE `ReleaseCopier`
+  worker queue, so an older release can never land after a newer explicit copy; a newer release
+  replaces any release still waiting (explicit copies are never dropped), so a stalled clipboard
+  cannot grow a backlog. OSC 52 is handed back and written by the event loop, which owns stdout —
+  an escape sequence from another thread could land in the middle of a frame — and the worker
+  waits for that write before its next copy, so a later native copy cannot be overwritten by it.
+  Entering edit mode drops waiting drag copies (editor copy/cut stay synchronous). A
+  wrongly-typed `copy_on_select` (`"false"`) is a schema error that keeps the last good value,
+  as in herdr. Clipboard helpers (`actions::copy_with`) count as success only when EVERY input
+  byte was delivered AND the helper exited 0, within one 5s deadline covering both: a helper
+  that exits 0 without reading its input did not copy, and the editor's cut deletes text on
+  success with no undo. Windows PowerShell helpers (`Get-Clipboard`) run without an inherited
+  `PSModulePath` for the issue #96 reason. Known gap: a drag copy already IN FLIGHT can still
+  land after a synchronous editor copy, and closing the viewer does not wait for a queued copy.
+  Selection preserves
   syntax/diff styling on screen, omits file line-number gutters, and does not insert newlines at
   visual wrap boundaries.
 - Preview return focus is durable pane metadata (`hs-preview-origin-tab`), not
@@ -886,6 +1087,9 @@ setting are all gone.
   request still matches the current document. Collect the receiver before drawing each frame and
   use the 16ms `LOAD_POLL` only while a worker is active: checking it after the normal 250ms idle
   event wait added a second polling interval, making otherwise-fast swaps take about half a second.
+- `glow` receives the actual preview-body width and the configured light/dark color mode. Its
+  terminal-formatted output bypasses the generic text wrapper; first-load and resize mismatches
+  schedule one background reload at the new width while preserving the reader's scroll offset.
 - Raster image previews are decoded in-process and rendered as true-color `▀` cells (foreground
   = upper pixel, background = lower pixel), so they work through herdr's terminal compositor
   without Kitty/Sixel passthrough. They preserve aspect ratio, center, and rebuild from the
@@ -921,14 +1125,16 @@ setting are all gone.
   coarse timestamps and same-length rewrites can miss real changes.
 - Sidebar Esc cannot directly `pane.close` a live preview anymore: pane close kills the TUI
   before it can confirm dirty state. `close_in_tab` writes a `close` control request; the
-  viewer confirms save/discard/cancel and then closes itself (stale viewers are still killed
-  directly). The same prompt guards control-file switches to another preview.
+  viewer confirms save/discard/cancel and then closes itself (only label-only resumed husks
+  are killed directly; a stale stamp gets the request and a notice). The same prompt guards control-file switches to another preview.
 - Clipboard is best-effort and command-backed: `clip` / PowerShell `Get-Clipboard` on
-  Windows, `pbcopy`/`pbpaste` on macOS, and wl-clipboard or xclip on Linux. Ctrl and Cmd
-  shortcuts are both accepted; CONTROL+ALT chars remain text so Windows AltGr layouts work.
-  A copy command counts only when its exit status succeeds. Do not treat writing OSC 52 bytes
-  as confirmed clipboard success: terminals provide no acknowledgement here, and unconditional
-  escape output would add a behavior/security compatibility change with no opt-out.
+  Windows, `pbcopy`/`pbpaste` on macOS, and wl-clipboard or xclip on Linux. Over SSH, copy
+  emits bounded OSC 52 only when stdout is a terminal, following herdr's own clipboard path;
+  Unix also falls back to OSC 52 when every native clipboard command fails in a terminal.
+  Callers describe that as "sent" rather than confirmed because terminals do not acknowledge
+  it. Editor cut keeps the selected text on that unacknowledged path because there is no undo.
+  Ctrl and Cmd shortcuts are both accepted; CONTROL+ALT chars remain text so Windows AltGr
+  layouts work.
 - ANSI parsing consumes complete OSC payloads through BEL or ST. Glow 3 emits OSC 8 hyperlinks
   under forced color; dropping only ESC exposes the hyperlink metadata as visible preview text.
 - Edit mode accepts terminal mouse input: click moves the caret, drag selects across logical and
@@ -1056,7 +1262,7 @@ end-to-end twice:
 
 0. **Shared backdrop (shoot session)** — shots are taken in the isolated
    `herdr --session shoot` server so herdr's left chrome shows a DUMMY roster, kept
-   IDENTICAL to the herdr-aa-notes repo's shots (mirrored in that repo's CLAUDE.md):
+   identical across the sidebar's screenshot set:
    spaces `acme-app [main ↑1]` / `acme-api [main]` / `acme-web [dev]` /
    `billing-service [main]`; agents in acme-app's 2×2 grid: `auth-refactor` (claude),
    `checkout-tests` (codex), `api-docs` (codex, unsubmitted composer text),
@@ -1104,9 +1310,9 @@ end-to-end twice:
    `s` over the hero layout.
 5. **Frame**: `python tools/screenshots/frame_all.py <dir with crop-*.png>` writes the
    framed set straight into docs/media (gradient backdrop + macOS-style titlebar).
-6. **Teardown**: close the tab, PEB-scan-kill any process whose cwd is under acme-app
-   (see the feature-worktree skill for the snippet), delete acme-app + .acme-origin.git,
-   restore the window size.
+6. **Teardown**: close the disposable capture tab, stop only test processes still using
+   acme-app, verify the scratch paths before deleting acme-app + .acme-origin.git,
+   and restore the window size.
 
 Hard-won capture gotchas:
 
@@ -1116,7 +1322,7 @@ Hard-won capture gotchas:
   Code's auto-set terminal title happened to contain "herdr-shoot". Use
   **capture_exact.ps1** (exact title + PrintWindow PW_RENDERFULLCONTENT): immune to
   occlusion, monitors, and title collisions. Still **view every capture** before shipping.
-- **NO_COLOR kills Claude Code's orange** (the CLAUDE.md crossterm gotcha, shoot-server
+- **NO_COLOR kills Claude Code's orange** (the `AGENTS.md` crossterm gotcha, shoot-server
   edition): agent tool shells carry NO_COLOR=1 (even when a nested probe shell says
   otherwise — check `$env:NO_COLOR` in the ACTUAL shell), every server started from one
   passes it to every pane, and claude renders monochrome. Start the shoot server with
@@ -1210,4 +1416,5 @@ First clean install of both plugins on a Mac (driven over SSH), findings:
 
 `herdr-layout.yaml` at the repo root describes the workspace (Coordinator tab running claude,
 shell tab, git tab with lazygit). The Coordinator session delegates feature work to sibling
-panes — see `.claude/skills/feature-worktree/` (one feature = one git worktree = one pane).
+panes. Create feature worktrees only when explicitly requested; the old repository-local
+feature-worktree skill has been retired.
