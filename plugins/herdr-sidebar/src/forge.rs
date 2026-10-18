@@ -226,23 +226,28 @@ fn fetch_each(
     field: &'static str,
     per_repo: fn(&Path) -> Result<Value, String>,
 ) -> Value {
-    // One thread per repo: `gh` round trips dominate.
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = repos
-            .into_iter()
-            .map(|(slug, root)| {
-                scope.spawn(move || {
-                    let mut v = json!({"slug": slug, "root": root.to_string_lossy()});
-                    match per_repo(&root) {
-                        Ok(data) => v[field] = data,
-                        Err(e) => v["error"] = Value::String(e),
-                    }
-                    v
+    // `gh` round trips dominate, so a few run at once — but not one per
+    // repo: a space with many repos would start dozens of `gh` together.
+    let mut out = Vec::new();
+    for chunk in repos.chunks(4) {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|(slug, root)| {
+                    scope.spawn(move || {
+                        let mut v = json!({"slug": slug, "root": root.to_string_lossy()});
+                        match per_repo(root) {
+                            Ok(data) => v[field] = data,
+                            Err(e) => v["error"] = Value::String(e),
+                        }
+                        v
+                    })
                 })
-            })
-            .collect();
-        Value::Array(handles.into_iter().filter_map(|h| h.join().ok()).collect())
-    })
+                .collect();
+            out.extend(handles.into_iter().filter_map(|h| h.join().ok()));
+        });
+    }
+    Value::Array(out)
 }
 
 fn key(kind: &str, repos: &[(String, PathBuf)]) -> String {

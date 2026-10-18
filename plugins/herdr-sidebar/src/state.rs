@@ -688,6 +688,8 @@ pub struct ScmState {
     /// Tree-view folders the user collapsed, as JSON `(repo root, staged,
     /// path)` triples. The tree/list MODE itself is global (`scm_tree_view`).
     pub collapsed_dirs: Vec<String>,
+    /// Roots of the repos folded in a multi-repo list; they are not polled.
+    pub collapsed_repos: Vec<String>,
 }
 
 fn scm_path() -> Option<PathBuf> {
@@ -734,15 +736,19 @@ fn scm_state_for(file: &ScmFile, cwd: &Path) -> ScmState {
                 .collect()
         })
         .unwrap_or_default();
-    let collapsed_dirs = entry
-        .get("collapsed_dirs")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|s| s.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    let strings = |field: &str| -> Vec<String> {
+        entry
+            .get(field)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let collapsed_dirs = strings("collapsed_dirs");
+    let collapsed_repos = strings("collapsed_repos");
     ScmState {
         drawers,
         active_root: entry
@@ -774,6 +780,7 @@ fn scm_state_for(file: &ScmFile, cwd: &Path) -> ScmState {
             .unwrap_or_default(),
         cleared_drafts: std::collections::BTreeSet::new(),
         collapsed_dirs,
+        collapsed_repos,
     }
 }
 
@@ -815,6 +822,7 @@ pub fn save_scm_state(cwd: &Path, state: &ScmState) -> bool {
             "scroll": state.scroll,
             "drafts": drafts,
             "collapsed_dirs": state.collapsed_dirs,
+            "collapsed_repos": state.collapsed_repos,
         }),
     );
     serde_json::to_string(&file)
@@ -1198,10 +1206,11 @@ mod tests {
 
     #[test]
     fn scm_state_roundtrips_collapsed_dirs_and_ignores_legacy_tree_view() {
-        let json = r#"{"/repo/project":{"tree_view":true,"collapsed_dirs":["src","tests"]}}"#;
+        let json = r#"{"/repo/project":{"tree_view":true,"collapsed_dirs":["src","tests"],"collapsed_repos":["/repo/project/a"]}}"#;
         let file = decode_scm_file(json);
         let st = scm_state_for(&file, Path::new("/repo/project"));
         assert_eq!(st.collapsed_dirs, vec!["src", "tests"]);
+        assert_eq!(st.collapsed_repos, vec!["/repo/project/a"]);
     }
 
     #[test]

@@ -1013,6 +1013,8 @@ pub struct App {
     pub tree_view: bool,
     /// Keep polling Git status while unfocused ([`sidebar::BACKGROUND_REFRESH_ENV`]).
     background_refresh: bool,
+    /// Earliest periodic `git status` round; spaced by the last round's cost.
+    next_status: std::time::Instant,
 }
 
 const MY_VIEW: View = View::SourceControl;
@@ -1085,6 +1087,7 @@ impl App {
                 repo.message = message.chars().collect();
                 repo.cursor = repo.message.len();
             }
+            repo.collapsed = saved.collapsed_repos.contains(&root);
             for dir in &saved.collapsed_dirs {
                 if let Ok((root, staged, path)) =
                     serde_json::from_str::<(String, bool, String)>(dir)
@@ -1143,6 +1146,7 @@ impl App {
                     .ok()
                     .as_deref(),
             ),
+            next_status: std::time::Instant::now(),
         };
         app.apply_identity();
         app.refresh();
@@ -1246,13 +1250,23 @@ impl App {
     /// tick() calls it every [`crate::REFRESH_EVERY`]); keeps the flash so
     /// periodic ticks don't eat notices.
     pub fn refresh(&mut self) {
+        let started = std::time::Instant::now();
         let mut error = None;
+        let multi = self.repos.len() > 1;
         for repo in &mut self.repos {
+            // A folded repo keeps its last status (read once for the branch
+            // in its header) and is not polled until it is unfolded.
+            if multi && repo.collapsed && !repo.status.branch.is_empty() {
+                continue;
+            }
             match repo.git.status() {
                 Ok(status) => repo.status = status,
                 Err(e) => error = Some(e),
             }
         }
+        // Many repos make a round slow (19 repos ≈ 1 s on Windows): wait 4×
+        // its cost before the next periodic one so git is not busy nonstop.
+        self.next_status = std::time::Instant::now() + started.elapsed() * 4;
         if let Some(e) = error {
             self.flash = Some((e, true));
         }
@@ -1417,7 +1431,13 @@ impl App {
                 self.discover_err.clear();
             }
         }
-        self.refresh();
+        if self.github {
+            // The GitHub view shows no file status: skip the git round.
+            self.reload_expanded_drawers();
+            self.rebuild();
+        } else if std::time::Instant::now() >= self.next_status {
+            self.refresh();
+        }
     }
 
     pub fn is_syncing(&self) -> bool {
@@ -3570,7 +3590,14 @@ impl App {
                 serde_json::to_string(&(repo.git.root().to_string_lossy(), false, path)).unwrap()
             }));
         }
+        let collapsed_repos = self
+            .repos
+            .iter()
+            .filter(|r| r.collapsed)
+            .map(|r| sidebar::scm_path_key(r.git.root()))
+            .collect();
         sidebar::ScmState {
+            collapsed_repos,
             drawers,
             active_root,
             selected,
@@ -3816,8 +3843,15 @@ impl App {
             Row::Message(_) | Row::Commit(_) => {}
             Row::DrawerLine(kind, i) => self.open_drawer_ref(kind, i),
             Row::RepoHeader(r) => {
-                self.repos[r].collapsed = !self.repos[r].collapsed;
+                let repo = &mut self.repos[r];
+                repo.collapsed = !repo.collapsed;
+                if !repo.collapsed
+                    && let Ok(status) = repo.git.status()
+                {
+                    repo.status = status;
+                }
                 self.rebuild();
+                self.persist_scm();
             }
             Row::StagedHeader(r) => {
                 self.repos[r].staged_collapsed = !self.repos[r].staged_collapsed;
