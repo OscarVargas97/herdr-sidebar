@@ -1547,17 +1547,27 @@ impl App {
 
     /// The GitHub sections over every visible repo (forge caches `gh`).
     fn reload_github(&mut self) {
+        // Repos folded in Source Control are hidden here too (not queried).
+        let multi = self.multi();
+        let folded: Vec<String> = self
+            .repos
+            .iter()
+            .filter(|r| multi && r.collapsed)
+            .map(|r| sidebar::scm_path_key(r.git.root()))
+            .collect();
         let mut checkouts: Vec<(PathBuf, String)> = self
             .repos
             .iter()
+            .filter(|r| !(multi && r.collapsed))
             .map(|r| (r.git.root().to_path_buf(), r.status.branch.clone()))
             .collect();
         // A space's worktrees sit deeper than the Source Control scan.
         for (dir, branch) in herdr_sidebar::forge::space_checkouts(&self.cwd) {
             let key = sidebar::scm_path_key(&dir);
-            if !checkouts
-                .iter()
-                .any(|(r, _)| sidebar::scm_path_key(r) == key)
+            if !folded.contains(&key)
+                && !checkouts
+                    .iter()
+                    .any(|(r, _)| sidebar::scm_path_key(r) == key)
             {
                 checkouts.push((dir, branch));
             }
