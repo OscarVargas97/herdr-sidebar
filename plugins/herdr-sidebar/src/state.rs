@@ -275,6 +275,9 @@ pub struct State {
     /// Restore the Search activity rather than the Explorer tree when the
     /// unified sidebar is reopened. Search shares the Explorer process.
     pub search_active: bool,
+    /// Restore the GitHub activity rather than Source Control. GitHub shares
+    /// the Source Control process.
+    pub github_active: bool,
     /// Show the hotkey chips at the bottom of the sidebar (they always
     /// live in the ⚙ Settings modal; the footer copy is opt-in).
     pub show_hotkeys: bool,
@@ -333,6 +336,7 @@ impl Default for State {
             merged: true,
             active: View::Explorer,
             search_active: false,
+            github_active: false,
             show_hotkeys: false,
             show_git_footer: true,
             icons: None,
@@ -513,10 +517,11 @@ fn write_state(path: &Path, state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"github_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.search_active,
+        state.github_active,
         state.show_hotkeys,
         state.show_git_footer,
         state.font_prompt_done,
@@ -683,6 +688,8 @@ pub struct ScmState {
     /// Tree-view folders the user collapsed, as JSON `(repo root, staged,
     /// path)` triples. The tree/list MODE itself is global (`scm_tree_view`).
     pub collapsed_dirs: Vec<String>,
+    /// Roots of the repos folded in a multi-repo list; they are not polled.
+    pub collapsed_repos: Vec<String>,
 }
 
 fn scm_path() -> Option<PathBuf> {
@@ -729,15 +736,19 @@ fn scm_state_for(file: &ScmFile, cwd: &Path) -> ScmState {
                 .collect()
         })
         .unwrap_or_default();
-    let collapsed_dirs = entry
-        .get("collapsed_dirs")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|s| s.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    let strings = |field: &str| -> Vec<String> {
+        entry
+            .get(field)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let collapsed_dirs = strings("collapsed_dirs");
+    let collapsed_repos = strings("collapsed_repos");
     ScmState {
         drawers,
         active_root: entry
@@ -769,6 +780,7 @@ fn scm_state_for(file: &ScmFile, cwd: &Path) -> ScmState {
             .unwrap_or_default(),
         cleared_drafts: std::collections::BTreeSet::new(),
         collapsed_dirs,
+        collapsed_repos,
     }
 }
 
@@ -810,6 +822,7 @@ pub fn save_scm_state(cwd: &Path, state: &ScmState) -> bool {
             "scroll": state.scroll,
             "drafts": drafts,
             "collapsed_dirs": state.collapsed_dirs,
+            "collapsed_repos": state.collapsed_repos,
         }),
     );
     serde_json::to_string(&file)
@@ -915,6 +928,10 @@ pub fn parse_state(json: &str) -> State {
             .get("search_active")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.search_active),
+        github_active: value
+            .get("github_active")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.github_active),
         show_hotkeys: value
             .get("hotkeys")
             .and_then(|v| v.as_bool())
@@ -1109,6 +1126,7 @@ mod tests {
             merged: true,
             active: View::SourceControl,
             search_active: true,
+            github_active: true,
             show_hotkeys: true,
             show_git_footer: false,
             icons: Some(crate::icons::IconTheme::Emoji),
@@ -1125,7 +1143,7 @@ mod tests {
             custom_editor_on_click: true,
             scm_tree_view: true,
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"scm_tree_view\":true,\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"github_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"scm_tree_view\":true,\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         // Files written before the flag existed keep auto-open AND the git
@@ -1188,10 +1206,11 @@ mod tests {
 
     #[test]
     fn scm_state_roundtrips_collapsed_dirs_and_ignores_legacy_tree_view() {
-        let json = r#"{"/repo/project":{"tree_view":true,"collapsed_dirs":["src","tests"]}}"#;
+        let json = r#"{"/repo/project":{"tree_view":true,"collapsed_dirs":["src","tests"],"collapsed_repos":["/repo/project/a"]}}"#;
         let file = decode_scm_file(json);
         let st = scm_state_for(&file, Path::new("/repo/project"));
         assert_eq!(st.collapsed_dirs, vec!["src", "tests"]);
+        assert_eq!(st.collapsed_repos, vec!["/repo/project/a"]);
     }
 
     #[test]
